@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "thompsonzero"
+version = "0.1.0"
+description = "ThompsonZero: Thompson-sampling MCTS over Dirichlet value beliefs"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "torch>=2.4"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+thompsonzero = "thompsonzero.cli:main"
+
+[tool.maturin]
+python-source = "python"
+module-name = "thompsonzero._core"
+features = ["python"]

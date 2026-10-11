@@ -1,0 +1,4 @@
+# Built and run on the same machine (Ryzen 9950X): let LLVM use every
+# instruction it has (AVX-512, BMI2/popcnt for the bitboards).
+[build]
+rustflags = ["-C", "target-cpu=native"]
