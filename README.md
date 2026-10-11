@@ -102,9 +102,8 @@ W/D/L.
   simulation, one thread: ~2-3 us for `corr`, `additive`, `mixture` and
   `avgconc` (~5-6 us on Boop, whose ~50 legal moves are each sampled at every
   node), ~7-8 us for `additive_mle` (~11 us on Boop), whose MLE refresh
-  dominates.  A 16-core
-  9950X therefore searches well over 1M simulations/s, more than the GPU can
-  evaluate: the GPU is the bottleneck by design.
+  dominates.  A 16-core 9950X therefore searches well over 1M simulations/s,
+  more than the GPU can evaluate: the GPU is the bottleneck by design.
 * **Pipelined GPU inference.** Games are split into `groups`; while one
   group's batch is on the GPU (bf16, dedicated CUDA stream, `torch.compile`d
   with a symbolic batch size, padded only to a multiple of 128), the CPU
