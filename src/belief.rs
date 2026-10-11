@@ -444,14 +444,22 @@ pub fn digamma(mut x: f64) -> f64 {
     r + x.ln() - 0.5 / x + f * (-1.0 / 12.0 + f * (1.0 / 120.0 + f * (-1.0 / 252.0 + f * (1.0 / 240.0))))
 }
 
-fn trigamma(mut x: f64) -> f64 {
-    let mut r = 0.0;
+/// (digamma(x), trigamma(x)) sharing one recurrence: the Newton step of
+/// `inv_digamma` needs both, and it is the inner loop of the MLE refresh.
+fn digamma_trigamma(mut x: f64) -> (f64, f64) {
+    let (mut d, mut t) = (0.0, 0.0);
     while x < 6.0 {
-        r += 1.0 / (x * x);
+        let inv = 1.0 / x;
+        d -= inv;
+        t += 1.0 / (x * x);
         x += 1.0;
     }
+    let inv = 1.0 / x;
     let f = 1.0 / (x * x);
-    r + (1.0 / x) * (1.0 + 0.5 / x + f * (1.0 / 6.0 + f * (-1.0 / 30.0 + f * (1.0 / 42.0 + f * (-1.0 / 30.0)))))
+    (
+        d + x.ln() - 0.5 / x + f * (-1.0 / 12.0 + f * (1.0 / 120.0 + f * (-1.0 / 252.0 + f * (1.0 / 240.0)))),
+        t + inv * (1.0 + 0.5 / x + f * (1.0 / 6.0 + f * (-1.0 / 30.0 + f * (1.0 / 42.0 + f * (-1.0 / 30.0))))),
+    )
 }
 
 fn inv_digamma(y: f64) -> f64 {
@@ -461,7 +469,8 @@ fn inv_digamma(y: f64) -> f64 {
         -1.0 / (y - DIGAMMA_1)
     };
     for _ in 0..MLE_NEWTON {
-        x = (x - (digamma(x) - y) / trigamma(x)).max(1e-9);
+        let (d, t) = digamma_trigamma(x);
+        x = (x - (d - y) / t).max(1e-9);
     }
     x
 }
@@ -580,6 +589,10 @@ mod tests {
         assert!((digamma(1.0) - DIGAMMA_1).abs() < 1e-9);
         assert!((digamma(0.5) - (-1.963_510_026_021_423_5)).abs() < 1e-9);
         assert!((inv_digamma(digamma(3.7)) - 3.7).abs() < 1e-2);
+        for x in [1e-3, 0.37, 1.0, 5.99, 6.0, 42.0] {
+            assert_eq!(digamma_trigamma(x).0, digamma(x)); // bit-identical
+        }
+        assert!((digamma_trigamma(1.0).1 - std::f64::consts::PI.powi(2) / 6.0).abs() < 1e-9);
     }
 
     #[test]

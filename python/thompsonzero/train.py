@@ -20,6 +20,7 @@ import glob
 import json
 import os
 import queue
+import sys
 import time
 from collections import defaultdict
 
@@ -139,6 +140,10 @@ def train(cfg: Config):
     run = Run(cfg)
     device = pick_device(cfg.device)
     torch.manual_seed(cfg.seed)
+    # The self-play thread needs the GIL only in short bursts between Rust
+    # calls; a 1 ms switch interval (default 5 ms) bounds how long it can wait
+    # behind the trainer thread before the next GPU batch is launched.
+    sys.setswitchinterval(1e-3)
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision('high')

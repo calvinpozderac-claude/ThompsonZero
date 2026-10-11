@@ -97,14 +97,20 @@ W/D/L.
 
 * **Rust engine, all cores.** Thousands of concurrent games, each with its
   own arena-allocated tree (nodes store their game state, so descent never
-  replays moves).  `collect`/`apply` run in parallel over games with rayon and
-  release the GIL.  On a 4-core container the engine alone does ~200k
-  simulations/s with a constant network, so a 16-core 9950X has headroom of
-  several hundred thousand network evaluations per second: the GPU is the
-  bottleneck by design.
+  replays moves).  `collect`/`apply` run in parallel over games with rayon
+  (observation encoding included) and release the GIL.  Measured CPU cost per
+  simulation, one thread: ~2-3 us for `corr`, `additive`, `mixture` and
+  `avgconc` (~5-6 us on Boop, whose ~50 legal moves are each sampled at every
+  node), ~7-8 us for `additive_mle` (~11 us on Boop), whose MLE refresh
+  dominates.  A 16-core
+  9950X therefore searches well over 1M simulations/s, more than the GPU can
+  evaluate: the GPU is the bottleneck by design.
 * **Pipelined GPU inference.** Games are split into `groups`; while one
-  group's batch is on the GPU (bf16, dedicated CUDA stream, `torch.compile`d),
-  the CPU searches the next group.  Batch size = `num_games / groups * wave`.
+  group's batch is on the GPU (bf16, dedicated CUDA stream, `torch.compile`d
+  with a symbolic batch size, padded only to a multiple of 128), the CPU
+  searches the next group.  Batch size is up to `num_games / groups * wave`.
+  With a simulated GPU that is the bottleneck, the self-play thread keeps it
+  98-100% busy, including while a trainer thread competes for the GIL.
 * **Self-play and training run concurrently.** Self-play has its own bf16
   copy of the network; the trainer pushes weights into it every
   `sync_every_steps` steps via a staging buffer, without either side
@@ -114,10 +120,12 @@ W/D/L.
   are gathered there, so a training step moves nothing over PCIe.  The
   forward/loss is compiled and runs in bf16 autocast with fp32 loss maths.
 
-Tuning: run `thompsonzero bench`.  If the GPU is underfed (small batches),
-raise `num_games` (memory: about 0.5 KB per tree node for Othello, ~2 KB for Boop) or `wave` (more
-virtual-loss distortion per batch).  If training cannot keep up, self-play
-simply waits.  `RAYON_NUM_THREADS` caps the engine's threads.
+Tuning: run `thompsonzero bench` (engine, inference and training throughput
+in isolation).  If the GPU is underfed (small batches), raise `num_games`
+(about 1 MB of RAM per concurrent Othello or Boop game at 400 sims, 0.1 MB for
+Connect Four) or `wave` (more virtual-loss distortion per batch).  If
+training cannot keep up, self-play simply waits.  `RAYON_NUM_THREADS` caps the
+engine's threads.
 
 ## Extending
 
@@ -145,7 +153,12 @@ pytest tests                  # bindings, self-play samples, arena, loss, traini
 The Rust games were also cross-checked against the originals on random
 playouts (legal actions, results and observations at every ply): 3000
 Connect Four and 1000 Othello games against open_spiel's C++ games, 400
-Boop games against the Python Boop of `boop_thompson_worker.py`.
+Boop games against the Python Boop of `boop_thompson_worker.py`.  The search
+was checked the same way: the original `connect4_dirichlet_utils` search and
+this tree, run 120-150 times each on the same Othello positions with the same
+fixed network, give statistically indistinguishable root visit distributions,
+state and edge targets, and solver results for all five evidence rules
+(opening, middlegame and solved endgames).
 
 ## Relation to the open_spiel research code
 

@@ -23,11 +23,10 @@ from .network import activate
 
 
 def _bucket(n):
-    """Pad batches to a few fixed sizes so compiled graphs are reused."""
-    b = 64
-    while b < n:
-        b *= 2
-    return b
+    """Rows to run for an n-row batch.  The compiled graph has a symbolic
+    batch size, so this only rounds up to a multiple of 128 (bounded waste,
+    and a bounded number of shapes for cuDNN's autotuner to benchmark)."""
+    return max(64, -(-n // 128) * 128)
 
 
 class Evaluator:

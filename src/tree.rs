@@ -34,7 +34,8 @@ pub struct SearchCfg {
 }
 
 impl SearchCfg {
-    fn track(&self) -> Track {
+    /// Statistics an EDGE accumulator keeps: edges feed selection and targets.
+    fn edge_track(&self) -> Track {
         let (a, b) = (self.search.track(), self.target.track());
         Track {
             mle: a.mle || b.mle,
@@ -42,10 +43,18 @@ impl SearchCfg {
         }
     }
 
+    /// Statistics a NODE accumulator keeps: nodes only feed state targets.
+    /// (Skipping the MLE here is what makes search=additive_mle with
+    /// target=avgconc cheap: the MLE refresh is the costliest thing in a
+    /// backup, and a node's would never be read.)
+    fn node_track(&self) -> Track {
+        self.target.track()
+    }
+
     /// Proven terminals go up as exact one-hots under `corr` (zero variance),
     /// as finite spikes otherwise.
     fn terminal_obs(&self, outcome: usize) -> Obs {
-        if self.track().corr {
+        if self.edge_track().corr {
             Obs::exact(outcome)
         } else {
             Obs::from_alpha(spike(outcome))
@@ -182,7 +191,7 @@ impl<G: Game> Tree<G> {
         }
         let v_alpha = to64(alpha(ev.v));
         let mut acc = Acc::default();
-        acc.add(&self.leaf_obs(v_alpha, cfg, rng), cfg.track());
+        acc.add(&self.leaf_obs(v_alpha, cfg, rng), cfg.node_track());
         let player = state.current_player() as u8;
         self.nodes.push(Node {
             state,
@@ -286,7 +295,7 @@ impl<G: Game> Tree<G> {
     /// Fold one observation (in `persp`'s perspective) into every node and
     /// edge on the path, flipping it for nodes whose mover is the other player.
     pub fn backup(&mut self, path: &[(u32, u32)], obs: Obs, persp: u8, cfg: &SearchCfg) {
-        let track = cfg.track();
+        let (edge_track, node_track) = (cfg.edge_track(), cfg.node_track());
         let flipped = obs.flipped();
         for &(n, e) in path.iter().rev() {
             let o = if self.nodes[n as usize].player == persp {
@@ -300,8 +309,8 @@ impl<G: Game> Tree<G> {
                 edge.acc = self.accs.len() as u32;
                 self.accs.push(Acc::default());
             }
-            self.accs[edge.acc as usize].add(o, track);
-            self.nodes[n as usize].acc.add(o, track);
+            self.accs[edge.acc as usize].add(o, edge_track);
+            self.nodes[n as usize].acc.add(o, node_track);
             self.refresh(e as usize, cfg);
         }
     }

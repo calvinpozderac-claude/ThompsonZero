@@ -226,28 +226,34 @@ impl<G: Game> Engine<G> {
     pub fn collect(&mut self, group: usize) -> (Vec<f32>, Vec<u8>) {
         let r = self.group_range(group);
         let cfg = &self.cfg;
-        self.slots[r.clone()].par_iter_mut().for_each(|s| s.collect(cfg));
-        let total: usize = self.slots[r.clone()].iter().map(|s| s.requests.len()).sum();
-        let mut obs = vec![0f32; total * G::OBS_SIZE];
-        let mut nets = Vec::with_capacity(total);
-        let mut row = 0;
-        for i in r {
-            let s = &self.slots[i];
-            self.counts[i] = s.requests.len();
+        let slots = &mut self.slots[r.clone()];
+        slots.par_iter_mut().for_each(|s| s.collect(cfg));
+        let mut nets = Vec::new();
+        for (s, count) in slots.iter().zip(&mut self.counts[r]) {
+            *count = s.requests.len();
             let net = if cfg.arena_games.is_some() {
                 s.seat0 ^ s.state.current_player() as u8
             } else {
                 0
             };
-            for q in &s.requests {
-                let st = match q {
-                    Request::Root(st) | Request::Child { state: st, .. } => st,
-                };
-                st.encode(&mut obs[row * G::OBS_SIZE..(row + 1) * G::OBS_SIZE]);
-                nets.push(net);
-                row += 1;
-            }
+            nets.extend(std::iter::repeat_n(net, *count));
         }
+        // encode in parallel, each slot straight into its own rows
+        let mut obs = vec![0f32; nets.len() * G::OBS_SIZE];
+        let mut chunks = Vec::with_capacity(slots.len());
+        let mut rest = obs.as_mut_slice();
+        for s in slots.iter() {
+            let (head, tail) = rest.split_at_mut(s.requests.len() * G::OBS_SIZE);
+            chunks.push(head);
+            rest = tail;
+        }
+        slots.par_iter().zip(chunks).for_each(|(s, out)| {
+            for (q, row) in s.requests.iter().zip(out.chunks_exact_mut(G::OBS_SIZE)) {
+                match q {
+                    Request::Root(st) | Request::Child { state: st, .. } => st.encode(row),
+                }
+            }
+        });
         (obs, nets)
     }
 
@@ -269,6 +275,9 @@ impl<G: Game> Engine<G> {
             .par_iter_mut()
             .zip(offsets)
             .for_each(|(s, off)| s.apply(cfg, started, &v[off * 4..], &a[off * G::NUM_ACTIONS * 4..]));
+        // consumed: a repeated apply now expects (and gets) zero rows
+        let r = self.group_range(group);
+        self.counts[r].fill(0);
         for s in &mut self.slots {
             self.finished.append(&mut s.finished);
             self.stats.merge(&std::mem::take(&mut s.stats));
@@ -412,6 +421,8 @@ impl<G: Game> Slot<G> {
         }
         self.done += self.pending.len();
         self.stats.sims += self.pending.len() as u64;
+        self.pending.clear();
+        self.paths.clear();
         if self.tree.is_empty() || (self.done < self.sims && self.tree.solved(0).is_none()) {
             return;
         }
