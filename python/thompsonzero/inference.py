@@ -19,8 +19,6 @@ import threading
 import numpy as np
 import torch
 
-from .network import activate
-
 
 def _bucket(n):
     """Rows to run for an n-row batch.  The compiled graph has a symbolic
@@ -41,6 +39,10 @@ class Evaluator:
             p.requires_grad_(False)
         self.forward = self.net
         self.stream = torch.cuda.Stream(self.device) if self.cuda else None
+        if self.cuda:
+            # the copy and cast above ran on the current stream; inference
+            # runs on self.stream and must not read the weights before they land
+            self.stream.wait_stream(torch.cuda.current_stream(self.device))
         self.lock = threading.Lock()
         self._staged = None        # weight staging buffers (see load_from)
         self._read_done = None
@@ -54,7 +56,7 @@ class Evaluator:
         self.forward = torch.compile(self.net, dynamic=True)
         try:
             for n in (64, 128):
-                self.evaluate(np.zeros((n, *self.net.obs_shape), np.float32), self.net.num_actions)
+                self.evaluate(np.zeros((n, *self.net.obs_shape), np.float32))
         except Exception as e:  # noqa: BLE001 -- any compiler failure
             print(f'torch.compile unavailable for inference ({type(e).__name__}: {e}); using eager')
             self.forward = self.net
@@ -101,43 +103,44 @@ class Evaluator:
         pad = _bucket(n) - n
         if pad:
             x = torch.cat([x, x.new_zeros((pad, *x.shape[1:]))])
+        post = self.net.postprocess
         with self.lock:
             if not self.cuda:
-                v, a = self.forward(x.to(self.dtype))
-                return n, activate(v[:n]).numpy(), activate(a[:n]).numpy(), None
+                return post(*(y[:n] for y in self.forward(x.to(self.dtype)))), None
             with torch.cuda.stream(self.stream):
                 x = x.pin_memory().to(self.device, self.dtype, non_blocking=True)
-                v, a = self.forward(x)
-                v = activate(v[:n]).to('cpu', non_blocking=True)
-                a = activate(a[:n]).to('cpu', non_blocking=True)
+                outs = post(*(y[:n] for y in self.forward(x)))
+                outs = tuple(y.to('cpu', non_blocking=True) for y in outs)
                 done = torch.cuda.Event()
                 done.record(self.stream)
-        return n, v, a, done
+        return outs, done
 
-    @staticmethod
-    def result(handle, num_actions):
-        """Wait for a handle; returns (v (n, 4), a (n, A, 4)) float32 numpy."""
+    def result(self, handle):
+        """Wait for a handle; returns the network's engine inputs as float32
+        numpy arrays (see `postprocess` in network.py)."""
         if handle is None:
-            return np.zeros((0, 4), np.float32), np.zeros((0, num_actions, 4), np.float32)
-        n, v, a, done = handle
+            return self.net.empty_outputs()
+        outs, done = handle
         if done is not None:
             done.synchronize()
-            v, a = v.numpy(), a.numpy()
-        return v, a
+        return tuple(y.numpy() for y in outs)
 
-    def evaluate(self, obs, num_actions):
-        return self.result(self.submit(obs), num_actions)
+    def evaluate(self, obs):
+        return self.result(self.submit(obs))
 
 
-def evaluate_split(evaluators, obs, nets, num_actions):
+def evaluate_split(evaluators, obs, nets):
     """Arena batches: row i is evaluated by evaluators[nets[i]]."""
-    v = np.zeros((len(obs), 4), np.float32)
-    a = np.zeros((len(obs), num_actions, 4), np.float32)
-    handles = [(k, nets == k, ev.submit(obs[nets == k])) for k, ev in enumerate(evaluators)]
-    for k, mask, h in handles:
+    handles = [(nets == k, ev.submit(obs[nets == k])) for k, ev in enumerate(evaluators)]
+    outs = None
+    for (mask, h), ev in zip(handles, evaluators):
+        res = ev.result(h)
+        if outs is None:
+            outs = tuple(np.zeros((len(obs), *y.shape[1:]), np.float32) for y in res)
         if mask.any():
-            v[mask], a[mask] = Evaluator.result(h, num_actions)
-    return v, a
+            for o, y in zip(outs, res):
+                o[mask] = y
+    return outs
 
 
 class SelfPlay(threading.Thread):
@@ -167,13 +170,12 @@ class SelfPlay(threading.Thread):
 
     def _loop(self):
         eng, ev = self.engine, self.evaluator
-        A = eng.num_actions
         collected = [False] * eng.groups
         pending = [None] * eng.groups
         while not self._stop.is_set():
             for g in range(eng.groups):
                 if collected[g]:  # even with no rows: finished searches play their move
-                    eng.apply(g, *Evaluator.result(pending[g], A))
+                    eng.apply(g, *ev.result(pending[g]))
                 if self.sims is not None:
                     eng.set_sims(self.sims)
                 obs, _nets = eng.collect(g)

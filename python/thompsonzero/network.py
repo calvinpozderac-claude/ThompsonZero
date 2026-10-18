@@ -1,4 +1,6 @@
-"""The network: a residual trunk with two Dirichlet heads.
+"""The networks.
+
+ThompsonZero (`DirichletNet`): a residual trunk with two Dirichlet heads.
 
 Both heads emit four numbers per belief, (logit_win, logit_draw, logit_loss,
 raw concentration), from the mover's perspective:
@@ -7,6 +9,25 @@ raw concentration), from the mover's perspective:
     Q(s,a) = Dir(conc(raw_a) * softmax(logits_a))       action head, (B, A, 4)
 
 There is no policy head: search selects by Thompson sampling Q.
+
+With `cal`, each belief gets a fifth number, a CALIBRATED log-concentration
+read off the trunk features with the gradient stopped (so it cannot change
+what the trunk or the means learn), trained on high-concentration point
+targets (`loss.cal_kl`).  `use_cal` makes the search see it in place of the
+model's own concentration.
+
+The trunk is either the research one (`trunk='se'`: GroupNorm residual blocks
+with squeeze-excitation) or AlphaGo Zero's (`trunk='az'`: BatchNorm, no SE),
+the same trunk `AZNet` uses, so a TZ net can differ from the AlphaZero
+baseline in its heads only.
+
+AlphaZero (`AZNet`): the AlphaGo Zero network, as OLIVAW uses it -- a
+convolutional block, a tower of plain residual blocks (BatchNorm, no
+squeeze-excitation), a policy head (logits over every action id) and a tanh
+value head.
+
+`postprocess` turns a forward pass into the arrays the matching Rust engine
+consumes, and `empty_outputs` is the same for a batch of zero rows.
 """
 import torch
 import torch.nn as nn
@@ -29,18 +50,30 @@ def conc(raw):
     return torch.where(raw > 20.0, raw, torch.where(raw < -10.0, tail, body))
 
 
+CAL_INIT = 2.3           # exp(2.3) = 10
+CAL_RANGE = (-5.0, 12.0)  # exp: 0.007 .. 163k
+
+
+def cal_conc(raw):
+    """The calibrated channel (raw[..., 4]) -> concentration (exp: it spans
+    orders of magnitude between openings and endgames)."""
+    return torch.exp(raw[..., 4:5].float().clamp(*CAL_RANGE))
+
+
 def alphas(raw):
-    """(..., 4) raw head output -> (..., 3) Dirichlet parameters (fp32)."""
+    """(..., 4 or 5) raw head output -> (..., 3) Dirichlet parameters (fp32)
+    with the model's own concentration."""
     raw = raw.float()
     p = torch.softmax(raw[..., :3], dim=-1)
-    return (conc(raw[..., 3:]) * p).clamp_min(ALPHA_FLOOR)
+    return (conc(raw[..., 3:4]) * p).clamp_min(ALPHA_FLOOR)
 
 
-def activate(raw):
-    """(..., 4) raw -> (..., 4) (p_win, p_draw, p_loss, concentration), the
-    format the Rust engine consumes."""
+def activate(raw, cal=False):
+    """(..., 4 or 5) raw -> (..., 4) (p_win, p_draw, p_loss, concentration),
+    the format the Rust engine consumes; `cal`: the calibrated concentration."""
     raw = raw.float()
-    return torch.cat([torch.softmax(raw[..., :3], dim=-1), conc(raw[..., 3:])], dim=-1)
+    c = cal_conc(raw) if cal else conc(raw[..., 3:4])
+    return torch.cat([torch.softmax(raw[..., :3], dim=-1), c], dim=-1)
 
 
 def _norm(ch):
@@ -76,15 +109,23 @@ class ResBlock(nn.Module):
 class DirichletNet(nn.Module):
     """forward(x) -> (v_raw (B, 4), a_raw (B, A, 4))."""
 
-    def __init__(self, obs_shape, num_actions, channels=64, blocks=10, head_channels=8):
+    def __init__(self, obs_shape, num_actions, channels=64, blocks=10, head_channels=8, trunk='se',
+                 cal=False):
         super().__init__()
+        self.use_cal = False
         c, h, w = obs_shape
         self.obs_shape, self.num_actions = tuple(obs_shape), num_actions
+        if trunk == 'se':
+            norm, block = _norm, ResBlock
+        elif trunk == 'az':
+            norm, block = nn.BatchNorm2d, AZResBlock
+        else:
+            raise ValueError(f'unknown trunk {trunk!r}; expected se | az')
         self.stem = nn.Sequential(nn.Conv2d(c, channels, 3, padding=1, bias=False),
-                                  _norm(channels), nn.ReLU(inplace=True))
-        self.trunk = nn.Sequential(*[ResBlock(channels) for _ in range(blocks)])
+                                  norm(channels), nn.ReLU(inplace=True))
+        self.trunk = nn.Sequential(*[block(channels) for _ in range(blocks)])
         self.head = nn.Sequential(nn.Conv2d(channels, head_channels, 1, bias=False),
-                                  _norm(head_channels), nn.ReLU(inplace=True), nn.Flatten())
+                                  norm(head_channels), nn.ReLU(inplace=True), nn.Flatten())
         flat = head_channels * h * w
         self.v_out = nn.Linear(flat, 4)
         self.a_out = nn.Linear(flat, num_actions * 4)
@@ -94,11 +135,81 @@ class DirichletNet(nn.Module):
                 nn.init.normal_(lin.weight, std=HEAD_INIT_STD)
                 lin.bias.view(-1, 4).zero_()
                 lin.bias.view(-1, 4)[:, 3] = HEAD_CONC_BIAS
+        self.cal = cal
+        if cal:
+            self.v_cal = nn.Linear(flat, 1)
+            self.a_cal = nn.Linear(flat, num_actions)
+            with torch.no_grad():
+                for lin in (self.v_cal, self.a_cal):
+                    nn.init.normal_(lin.weight, std=HEAD_INIT_STD)
+                    lin.bias.fill_(CAL_INIT)
 
     def forward(self, x):
         h = self.head(self.trunk(self.stem(x)))
-        return self.v_out(h), self.a_out(h).view(-1, self.num_actions, 4)
+        v, a = self.v_out(h), self.a_out(h).view(-1, self.num_actions, 4)
+        if self.cal:
+            hd = h.detach()
+            v = torch.cat([v, self.v_cal(hd)], dim=-1)
+            a = torch.cat([a, self.a_cal(hd).unsqueeze(-1)], dim=-1)
+        return v, a
+
+    def postprocess(self, v, a):
+        """-> (v (B, 4), a (B, A, 4)) activated, for `Engine.apply`."""
+        cal = self.cal and self.use_cal
+        return activate(v, cal), activate(a, cal)
+
+    def empty_outputs(self):
+        return (torch.zeros((0, 4)).numpy(), torch.zeros((0, self.num_actions, 4)).numpy())
+
+
+class AZResBlock(nn.Module):
+    """AlphaGo Zero residual block: conv-BN-ReLU-conv-BN, skip, ReLU."""
+
+    def __init__(self, ch):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, padding=1, bias=False), nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
+            nn.Conv2d(ch, ch, 3, padding=1, bias=False), nn.BatchNorm2d(ch))
+
+    def forward(self, x):
+        return F.relu(self.body(x) + x)
+
+
+class AZNet(nn.Module):
+    """forward(x) -> (v (B,) in [-1, 1] for the mover, logits (B, A))."""
+
+    def __init__(self, obs_shape, num_actions, channels=128, blocks=10, value_hidden=256):
+        super().__init__()
+        c, h, w = obs_shape
+        self.obs_shape, self.num_actions = tuple(obs_shape), num_actions
+        self.stem = nn.Sequential(nn.Conv2d(c, channels, 3, padding=1, bias=False),
+                                  nn.BatchNorm2d(channels), nn.ReLU(inplace=True))
+        self.trunk = nn.Sequential(*[AZResBlock(channels) for _ in range(blocks)])
+        self.policy = nn.Sequential(
+            nn.Conv2d(channels, 2, 1, bias=False), nn.BatchNorm2d(2), nn.ReLU(inplace=True),
+            nn.Flatten(), nn.Linear(2 * h * w, num_actions))
+        self.value = nn.Sequential(
+            nn.Conv2d(channels, 1, 1, bias=False), nn.BatchNorm2d(1), nn.ReLU(inplace=True),
+            nn.Flatten(), nn.Linear(h * w, value_hidden), nn.ReLU(inplace=True),
+            nn.Linear(value_hidden, 1), nn.Tanh())
+
+    def forward(self, x):
+        t = self.trunk(self.stem(x))
+        return self.value(t).squeeze(1), self.policy(t)
+
+    @staticmethod
+    def postprocess(v, logits):
+        """-> (v (B,), logits (B, A)) as fp32, for `AzEngine.apply`."""
+        return v.float(), logits.float()
+
+    def empty_outputs(self):
+        return (torch.zeros((0,)).numpy(), torch.zeros((0, self.num_actions)).numpy())
 
 
 def build(cfg, obs_shape, num_actions):
-    return DirichletNet(obs_shape, num_actions, cfg.channels, cfg.blocks, cfg.head_channels)
+    if cfg.algo == 'az':
+        return AZNet(obs_shape, num_actions, cfg.channels, cfg.blocks)
+    net = DirichletNet(obs_shape, num_actions, cfg.channels, cfg.blocks, cfg.head_channels,
+                       cfg.trunk, cal=cfg.cal_conc > 0)
+    net.use_cal = cfg.cal_search
+    return net

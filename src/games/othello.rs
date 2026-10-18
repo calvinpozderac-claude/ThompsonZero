@@ -61,6 +61,28 @@ fn flips(me: u64, opp: u64, sq: u64) -> u64 {
     out
 }
 
+impl Othello {
+    /// The position in Edax's `setboard` format: 64 squares from a1 in
+    /// row-major order ('X' black, 'O' white, '-' empty), a space, and the
+    /// side to move.
+    pub fn edax_board(&self) -> String {
+        let mut s: String = (0..64)
+            .map(|i| {
+                let bit = 1u64 << i;
+                if self.discs[0] & bit != 0 {
+                    'X'
+                } else if self.discs[1] & bit != 0 {
+                    'O'
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        s.push_str(if self.to_move == 0 { " X" } else { " O" });
+        s
+    }
+}
+
 impl Game for Othello {
     const NAME: &'static str = "othello";
     const NUM_ACTIONS: usize = 65;

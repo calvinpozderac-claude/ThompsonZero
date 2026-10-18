@@ -1,12 +1,16 @@
-"""Command line: train, ladder, bench.
+"""Command line: train, ladder, league, bench, edax.
 
     thompsonzero train --game othello --rule corr
+    thompsonzero train --game othello --rule az --set channels=128
     thompsonzero train --run-dir runs/othello_corr          # resume
     thompsonzero train --game boop --set num_games=2048 --set wave=2
     thompsonzero ladder --run-dir runs/othello_corr --watch
+    thompsonzero league --dir runs/league --player az=runs/az50k_128 --player tz=runs/tz50k --watch
     thompsonzero bench --game othello
+    thompsonzero edax --run-dir runs/othello_az --bench 50000 --levels 4 6 8 10
 """
 import argparse
+import dataclasses
 import json
 import os
 import time
@@ -14,13 +18,12 @@ import time
 import numpy as np
 import torch
 
-from . import _core
+from . import _core, az, edax, league
 from .arena import Ladder, play_match
-from .config import Config, preset
+from .config import RULES, Config, preset
 from .inference import Evaluator
 from .network import build
-from .train import load_net, make_step, pick_device, train
-from .replay import ReplayBuffer
+from .train import load_net, make_buffer, make_engine, make_step, pick_device, train
 
 
 def _overrides(pairs):
@@ -69,7 +72,8 @@ def cmd_ladder(a):
             for opp in older:
                 ref, _ = load_net(os.path.join(a.run_dir, f'bench_{opp}.pt'), device)
                 evs = [Evaluator(net, device, cfg.amp), Evaluator(ref, device, cfg.amp)]
-                w, d, l = play_match(cfg, evs, a.games, a.sims, seed=lab + opp)
+                match = az.play_match if cfg.algo == 'az' else play_match
+                w, d, l = match(cfg, evs, a.games, a.sims, seed=lab + opp)
                 ladder.add(str(lab), str(opp), w, d, l)
                 print(f'{lab} vs {opp}: W{w} D{d} L{l}', flush=True)
             r = ladder.ratings()
@@ -80,16 +84,23 @@ def cmd_ladder(a):
         time.sleep(60)
 
 
+def _uniform(cfg, n, A):
+    """Engine inputs of a constant network for `n` rows."""
+    if cfg.algo == 'az':
+        return np.zeros(n, np.float32), np.zeros((n, A), np.float32)
+    v = np.tile(np.float32([1 / 3, 1 / 3, 1 / 3, 1.5]), (n, 1))
+    return v, np.broadcast_to(v[:, None, :], (n, A, 4)).copy()
+
+
 def cmd_bench(a):
     """Throughput of each stage in isolation, to size num_games/wave/batch."""
-    cfg = preset(a.game, a.rule)
+    cfg = preset(a.game, a.rule, **_overrides(a.set))
     device = pick_device(a.device)
     g = _core.GameState(cfg.game)
     A = g.num_actions
 
     # 1) engine alone, with a constant (uniform) network: pure CPU cost
-    eng = _core.Engine(cfg.game, num_games=a.games, groups=2, sims=a.sims, wave=cfg.wave,
-                       search=cfg.search_rule, target=cfg.target_rule)
+    eng = make_engine(dataclasses.replace(cfg, num_games=a.games, groups=2), 0, a.sims)
     t0, rows, calls = time.time(), 0, 0
     pend = [None, None]
     while time.time() - t0 < a.seconds:
@@ -100,8 +111,7 @@ def cmd_bench(a):
             n = len(obs)
             rows += n
             calls += 1
-            v = np.tile(np.float32([1 / 3, 1 / 3, 1 / 3, 1.5]), (n, 1))
-            pend[k] = (v, np.broadcast_to(v[:, None, :], (n, A, 4)).copy())
+            pend[k] = _uniform(cfg, n, A)
     s, dt = eng.stats(), time.time() - t0
     print(f'engine ({a.games} games, {a.sims} sims, {os.cpu_count()} threads): '
           f'{s["sims"] / dt / 1e3:.0f}k sims/s, {rows / dt / 1e3:.0f}k evals/s, '
@@ -114,22 +124,20 @@ def cmd_bench(a):
         for bs in (256, 1024, 2048, 4096):
             x = np.random.rand(bs, *g.obs_shape).astype(np.float32)
             for _ in range(3):
-                ev.evaluate(x, A)
+                ev.evaluate(x)
             t0, n = time.time(), 0
             while time.time() - t0 < 2.0:
-                ev.evaluate(x, A)
+                ev.evaluate(x)
                 n += bs
             print(f'inference amp={amp} compile={comp} batch {bs}: {n / (time.time() - t0) / 1e3:.0f}k rows/s')
 
     # 3) training step
     opt = torch.optim.AdamW(net.parameters(), lr=1e-3)
-    buf = ReplayBuffer(4 * cfg.batch_size, g.obs_shape, A, device)
-    eng = _core.Engine(cfg.game, num_games=64, groups=1, sims=8, wave=4)
+    buf = make_buffer(dataclasses.replace(cfg, buffer_size=4 * cfg.batch_size), g.obs_shape, A, device)
+    eng = make_engine(dataclasses.replace(cfg, num_games=64, groups=1), 0, 8)
     while len(buf) < cfg.batch_size:
         obs, _ = eng.collect(0)
-        n = len(obs)
-        v = np.tile(np.float32([1 / 3, 1 / 3, 1 / 3, 1.5]), (n, 1))
-        eng.apply(0, v, np.broadcast_to(v[:, None, :], (n, A, 4)).copy())
+        eng.apply(0, *_uniform(cfg, len(obs), A))
         buf.add(eng.drain())
     step = make_step(net, opt, cfg, device, buf)
     for _ in range(3):
@@ -149,7 +157,7 @@ def main(argv=None):
 
     t = sub.add_parser('train', help='train (or resume) a run')
     t.add_argument('--game', choices=['connect_four', 'connect4', 'othello', 'boop'])
-    t.add_argument('--rule', default='tz', choices=['tz', 'corr'])
+    t.add_argument('--rule', default='tz', choices=sorted(RULES))
     t.add_argument('--run-dir')
     t.add_argument('--set', action='append', metavar='KEY=VALUE', help='override a Config field')
     t.set_defaults(fn=cmd_train)
@@ -165,12 +173,16 @@ def main(argv=None):
 
     b = sub.add_parser('bench', help='measure engine / inference / training throughput')
     b.add_argument('--game', default='othello')
-    b.add_argument('--rule', default='tz', choices=['tz', 'corr'])
+    b.add_argument('--rule', default='tz', choices=sorted(RULES))
+    b.add_argument('--set', action='append', metavar='KEY=VALUE', help='override a Config field')
     b.add_argument('--games', type=int, default=1024)
     b.add_argument('--sims', type=int, default=400)
     b.add_argument('--seconds', type=float, default=10.0)
     b.add_argument('--device', default='auto')
     b.set_defaults(fn=cmd_bench)
+
+    league.add_parser(sub)
+    edax.add_parser(sub)
 
     a = p.parse_args(argv)
     a.fn(a)

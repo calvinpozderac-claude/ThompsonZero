@@ -31,11 +31,19 @@ pub struct SearchCfg {
     pub sample_leaf: bool,
     /// Penalty on the sampled value of an edge per in-flight selection.
     pub virtual_loss: f64,
+    /// Keep every optional statistic (reports rebuild any rule offline).
+    pub track_all: bool,
+    /// State targets from the most-visited edge's target (a one-ply max
+    /// backup) instead of the node's own accumulator.
+    pub best_value: bool,
 }
 
 impl SearchCfg {
     /// Statistics an EDGE accumulator keeps: edges feed selection and targets.
     fn edge_track(&self) -> Track {
+        if self.track_all {
+            return Track { mle: true, corr: true };
+        }
         let (a, b) = (self.search.track(), self.target.track());
         Track {
             mle: a.mle || b.mle,
@@ -48,13 +56,16 @@ impl SearchCfg {
     /// target=avgconc cheap: the MLE refresh is the costliest thing in a
     /// backup, and a node's would never be read.)
     fn node_track(&self) -> Track {
+        if self.track_all {
+            return Track { mle: true, corr: true };
+        }
         self.target.track()
     }
 
     /// Proven terminals go up as exact one-hots under `corr` (zero variance),
     /// as finite spikes otherwise.
     fn terminal_obs(&self, outcome: usize) -> Obs {
-        if self.edge_track().corr {
+        if matches!(self.search, Rule::Corr { .. }) || matches!(self.target, Rule::Corr { .. }) {
             Obs::exact(outcome)
         } else {
             Obs::from_alpha(spike(outcome))
@@ -100,6 +111,23 @@ pub enum Selected<G> {
     Terminal,
     /// Reached an unexpanded edge (the last on the path); `state` is its child.
     Leaf(G),
+}
+
+/// The searched root as the search left it, with each accumulator's raw
+/// statistics (see [`Acc::raw`]; zeros for an edge never searched).
+pub struct Report {
+    pub v_alpha: Dir,
+    pub node: [f64; RAW],
+    pub edges: Vec<EdgeReport>,
+}
+
+pub struct EdgeReport {
+    pub action: u16,
+    /// Proven outcome for the root's mover, or -1.
+    pub term: i8,
+    pub prior: Dir,
+    pub sel: Dir,
+    pub acc: [f64; RAW],
 }
 
 /// A training target read off a searched node.
@@ -361,12 +389,12 @@ impl<G: Game> Tree<G> {
     }
 
     /// Index (into `edges_of(0)`) of the move to play.  `thompson`: one more
-    /// Thompson sample of the root beliefs.  Otherwise the best posterior
-    /// mean among edges search actually touched.
-    pub fn pick<R: Rng>(&self, rng: &mut R, thompson: bool) -> usize {
+    /// Thompson sample of the root beliefs, drawn from Dir(temp * α).
+    /// Otherwise the best posterior mean among edges search actually touched.
+    pub fn pick<R: Rng>(&self, rng: &mut R, thompson: Option<f64>) -> usize {
         let lo = self.nodes[0].first as usize;
-        if thompson {
-            return self.sample_edge(0, rng, 1.0, 0.0) - lo;
+        if let Some(temp) = thompson {
+            return self.sample_edge(0, rng, temp, 0.0) - lo;
         }
         let edges = self.edges_of(0);
         let touched = |e: &Edge| e.acc != NONE || e.term >= 0;
@@ -388,11 +416,9 @@ impl<G: Game> Tree<G> {
     /// edge search touched.  Proofs win over evidence.
     pub fn target(&self, n: u32, cfg: &SearchCfg) -> Target {
         let node = &self.nodes[n as usize];
-        let v = match self.solved(n) {
-            Some(o) => spike(o),
-            None => cfg.target.state_target(node.v_alpha, &node.acc),
-        };
         let mut edges = Vec::new();
+        // (visits, target) of the most-visited edge with a target
+        let mut best: Option<(f64, Dir)> = None;
         for e in self.edges_of(n) {
             let t = if e.term >= 0 {
                 Some(spike(e.term as usize))
@@ -402,11 +428,41 @@ impl<G: Game> Tree<G> {
                 None
             };
             if let Some(t) = t {
-                edges.push((e.action, floor_conc(t, TARGET_CONC_FLOOR)));
+                let t = floor_conc(t, TARGET_CONC_FLOOR);
+                let visits = if e.acc == NONE { 0.0 } else { self.accs[e.acc as usize].n };
+                if best.is_none_or(|(b, _)| visits > b) {
+                    best = Some((visits, t));
+                }
+                edges.push((e.action, t));
             }
         }
+        let v = match (self.solved(n), best) {
+            (Some(o), _) => spike(o),
+            (None, Some((_, t))) if cfg.best_value => t,
+            _ => cfg.target.state_target(node.v_alpha, &node.acc),
+        };
         Target {
             v: floor_conc(v, TARGET_CONC_FLOOR),
+            edges,
+        }
+    }
+
+    pub fn report(&self) -> Report {
+        let root = &self.nodes[0];
+        let edges = self
+            .edges_of(0)
+            .iter()
+            .map(|e| EdgeReport {
+                action: e.action,
+                term: e.term,
+                prior: to64(e.prior),
+                sel: to64(e.sel),
+                acc: if e.acc == NONE { [0.0; RAW] } else { self.accs[e.acc as usize].raw() },
+            })
+            .collect();
+        Report {
+            v_alpha: root.v_alpha,
+            node: root.acc.raw(),
             edges,
         }
     }
@@ -494,7 +550,23 @@ mod tests {
             target: r,
             sample_leaf: false,
             virtual_loss: 1.0,
+            track_all: false,
+            best_value: false,
         }
+    }
+
+    #[test]
+    fn best_value_targets_the_most_visited_edge() {
+        let mut c = cfg("additive");
+        c.best_value = true;
+        let mut rng = SmallRng::seed_from_u64(4);
+        let mut t: Tree<Connect4> = Tree::default();
+        search(&mut t, Connect4::new(), 200, &c, &mut rng);
+        let tg = t.target(0, &c);
+        let (i, _) = t.visits(0).enumerate().fold((0, -1.0), |b, (i, n)| if n > b.1 { (i, n) } else { b });
+        let a = t.edges_of(0)[i].action;
+        let e = tg.edges.iter().find(|(x, _)| *x == a).unwrap().1;
+        assert_eq!(tg.v, e);
     }
 
     #[test]
@@ -504,13 +576,15 @@ mod tests {
         for a in [0, 1, 0, 1, 0, 1] {
             s.apply(a);
         }
-        for rule in ["mixture", "additive", "additive_mle", "avgconc", "corr"] {
+        for rule in [
+            "mixture", "additive", "additive_mle", "avgconc", "corr", "additive_x16", "sumconc", "mean_mle", "point",
+        ] {
             let c = cfg(rule);
             let mut rng = SmallRng::seed_from_u64(1);
             let mut t = Tree::default();
             search(&mut t, s.clone(), 400, &c, &mut rng);
             assert_eq!(t.solved(0), Some(WIN), "{rule}");
-            let i = t.pick(&mut rng, false);
+            let i = t.pick(&mut rng, None);
             assert_eq!(t.edges_of(0)[i].action, 0, "{rule}");
         }
     }
@@ -536,7 +610,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(3);
         let mut t: Tree<Connect4> = Tree::default();
         search(&mut t, Connect4::new(), 300, &c, &mut rng);
-        let i = t.pick(&mut rng, false);
+        let i = t.pick(&mut rng, None);
         let child = t.edges_of(0)[i].child;
         let n_before = t.nodes[child as usize].acc.n;
         t.advance(i);

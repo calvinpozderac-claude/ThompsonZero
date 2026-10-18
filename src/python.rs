@@ -4,14 +4,20 @@
 //! the engine searches on every core.
 
 use numpy::ndarray::{Array1, Array2, Array3, Array4};
-use numpy::{IntoPyArray, PyArray1, PyArray3, PyArray4, PyReadonlyArray2, PyReadonlyArray3, PyUntypedArrayMethods};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    PyUntypedArrayMethods,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::belief::{Rule, TARGET_EPS};
-use crate::engine::{Config, Engine, Sample};
+use crate::az::{AzConfig, AzEngine, AzSample};
+use crate::belief::{Rule, RAW, TARGET_EPS};
+use crate::engine::{Config, Engine, Sample, Stats};
 use crate::games::{Boop, Connect4, Game, Othello};
+use crate::puct::PuctCfg;
+use crate::tree::Report;
 
 /// Run `$body` with `$g` bound to the concrete game type of `$name`.
 macro_rules! with_game {
@@ -52,32 +58,77 @@ macro_rules! each {
     };
 }
 
+enum AnyAz {
+    C4(AzEngine<Connect4>),
+    Othello(AzEngine<Othello>),
+    Boop(AzEngine<Boop>),
+}
+
+macro_rules! each_az {
+    ($any:expr, $e:ident => $body:expr) => {
+        match $any {
+            AnyAz::C4($e) => $body,
+            AnyAz::Othello($e) => $body,
+            AnyAz::Boop($e) => $body,
+        }
+    };
+}
+
 trait Wrap: Game + Sized {
     fn wrap(e: Engine<Self>) -> AnyEngine;
+    fn wrap_az(e: AzEngine<Self>) -> AnyAz;
     fn wrap_state(s: Self) -> AnyState;
+    fn unwrap_state(s: &AnyState) -> Option<Self>;
 }
 impl Wrap for Connect4 {
     fn wrap(e: Engine<Self>) -> AnyEngine {
         AnyEngine::C4(e)
     }
+    fn wrap_az(e: AzEngine<Self>) -> AnyAz {
+        AnyAz::C4(e)
+    }
     fn wrap_state(s: Self) -> AnyState {
         AnyState::C4(s)
+    }
+    fn unwrap_state(s: &AnyState) -> Option<Self> {
+        match s {
+            AnyState::C4(x) => Some(x.clone()),
+            _ => None,
+        }
     }
 }
 impl Wrap for Othello {
     fn wrap(e: Engine<Self>) -> AnyEngine {
         AnyEngine::Othello(e)
     }
+    fn wrap_az(e: AzEngine<Self>) -> AnyAz {
+        AnyAz::Othello(e)
+    }
     fn wrap_state(s: Self) -> AnyState {
         AnyState::Othello(s)
+    }
+    fn unwrap_state(s: &AnyState) -> Option<Self> {
+        match s {
+            AnyState::Othello(x) => Some(x.clone()),
+            _ => None,
+        }
     }
 }
 impl Wrap for Boop {
     fn wrap(e: Engine<Self>) -> AnyEngine {
         AnyEngine::Boop(e)
     }
+    fn wrap_az(e: AzEngine<Self>) -> AnyAz {
+        AnyAz::Boop(e)
+    }
     fn wrap_state(s: Self) -> AnyState {
         AnyState::Boop(s)
+    }
+    fn unwrap_state(s: &AnyState) -> Option<Self> {
+        match s {
+            AnyState::Boop(x) => Some(x.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -107,9 +158,9 @@ impl PyEngine {
     #[new]
     #[pyo3(signature = (game, *, num_games=512, groups=2, seed=0, sims=200, wave=4,
         search="additive_mle", target="avgconc", rho_search=0.8, rho_target=0.999,
-        sample_leaf=false, virtual_loss=1.0, descent_temp=1.0, temp_threshold=20,
-        max_plies=None, double_aux=1, double_min_visits=8.0, solved_aux=true,
-        arena_games=None, opening_plies=2))]
+        sample_leaf=false, best_value=false, virtual_loss=1.0, descent_temp=1.0, temp_threshold=20,
+        root_temp=1.0, max_plies=None, double_aux=1, double_min_visits=8.0, solved_aux=true,
+        arena_games=None, opening_plies=2, service=false, report=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         game: &str,
@@ -123,21 +174,31 @@ impl PyEngine {
         rho_search: f64,
         rho_target: f64,
         sample_leaf: bool,
+        best_value: bool,
         virtual_loss: f64,
         descent_temp: f64,
         temp_threshold: usize,
+        root_temp: f64,
         max_plies: Option<usize>,
         double_aux: usize,
         double_min_visits: f64,
         solved_aux: bool,
         arena_games: Option<usize>,
         opening_plies: usize,
+        service: bool,
+        report: bool,
     ) -> PyResult<Self> {
         if groups == 0 || num_games < groups {
             return Err(PyValueError::new_err("need num_games >= groups >= 1"));
         }
         if wave == 0 {
             return Err(PyValueError::new_err("wave must be >= 1"));
+        }
+        if service && arena_games.is_some() {
+            return Err(PyValueError::new_err("a search service plays no arena games"));
+        }
+        if report && !service {
+            return Err(PyValueError::new_err("reports come from a search service"));
         }
         let mut cfg = Config::new(
             Rule::parse(search, rho_search).map_err(PyValueError::new_err)?,
@@ -149,14 +210,19 @@ impl PyEngine {
         cfg.sims = sims;
         cfg.wave = wave;
         cfg.search.sample_leaf = sample_leaf;
+        cfg.search.best_value = best_value;
         cfg.search.virtual_loss = virtual_loss;
         cfg.descent_temp = descent_temp;
         cfg.temp_threshold = temp_threshold;
+        cfg.root_temp = root_temp;
         cfg.double_aux = double_aux;
         cfg.double_min_visits = double_min_visits;
         cfg.solved_aux = solved_aux;
         cfg.arena_games = arena_games;
         cfg.opening_plies = opening_plies;
+        cfg.service = service;
+        cfg.report = report;
+        cfg.search.track_all = report;
         with_game!(game, G => {
             cfg.max_plies = max_plies.unwrap_or(G::MAX_PLIES);
             Ok(PyEngine {
@@ -218,24 +284,7 @@ impl PyEngine {
     }
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let s = each!(&self.inner, e => e.stats().clone());
-        let d = PyDict::new(py);
-        for (k, v) in [
-            ("games", s.games),
-            ("plies", s.plies),
-            ("draws", s.draws),
-            ("cutoffs", s.cutoffs),
-            ("sims", s.sims),
-            ("evals", s.evals),
-            ("samples", s.samples),
-            ("solved_aux", s.solved_aux),
-            ("double_aux", s.double_aux),
-            ("wins", s.wins),
-            ("losses", s.losses),
-        ] {
-            d.set_item(k, v)?;
-        }
-        Ok(d)
+        stats_to_dict(py, &each!(&self.inner, e => e.stats().clone()))
     }
 
     /// Simulations per move for games started from now on.
@@ -243,10 +292,32 @@ impl PyEngine {
         each!(&mut self.inner, e => e.set_sims(sims))
     }
 
-    /// Arena mode: every game has been played.
+    /// Arena mode: every game has been played.  Search service: every
+    /// search has finished.
     #[getter]
     fn done(&self) -> bool {
         each!(&self.inner, e => e.done())
+    }
+
+    /// Search service: search `state` in the idle `slot`; its move comes
+    /// back from `moves` after enough collect/apply rounds.
+    fn search(&mut self, slot: usize, state: &PyGameState) -> PyResult<()> {
+        each!(&mut self.inner, e => search_in(e, slot, &state.inner))
+    }
+
+    /// Search service: [(slot, move)] of the searches finished since the
+    /// last call.
+    fn moves(&mut self) -> Vec<(usize, u16)> {
+        each!(&mut self.inner, e => e.moves())
+    }
+
+    /// Search service with `report=True`: [(slot, report)] of the searches
+    /// finished since the last call.  A report is a dict: `v_alpha` (3,) and
+    /// `node` (RAW,) for the root; `actions`, `term`, `prior` (E, 3), `sel`
+    /// (E, 3) and `acc` (E, RAW) per root edge (`Acc::raw` in belief.rs).
+    fn reports<'py>(&mut self, py: Python<'py>) -> PyResult<Vec<(usize, Bound<'py, PyDict>)>> {
+        let reps = each!(&mut self.inner, e => e.reports());
+        reps.iter().map(|(i, r)| Ok((*i, report_to_dict(py, r)?))).collect()
     }
 
     #[getter]
@@ -259,6 +330,315 @@ impl PyEngine {
     fn pending_rows(&self, group: usize) -> usize {
         each!(&self.inner, e => e.pending_rows(group))
     }
+}
+
+fn state_for<G: Wrap>(s: &AnyState) -> PyResult<G> {
+    G::unwrap_state(s).ok_or_else(|| PyValueError::new_err(format!("expected a {} state", G::NAME)))
+}
+
+fn search_in<G: Wrap>(e: &mut Engine<G>, slot: usize, s: &AnyState) -> PyResult<()> {
+    e.search(slot, state_for(s)?).map_err(PyValueError::new_err)
+}
+
+fn search_in_az<G: Wrap>(e: &mut AzEngine<G>, slot: usize, s: &AnyState) -> PyResult<()> {
+    e.search(slot, state_for(s)?).map_err(PyValueError::new_err)
+}
+
+fn stats_to_dict<'py>(py: Python<'py>, s: &Stats) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    for (k, v) in [
+        ("games", s.games),
+        ("plies", s.plies),
+        ("draws", s.draws),
+        ("cutoffs", s.cutoffs),
+        ("sims", s.sims),
+        ("evals", s.evals),
+        ("samples", s.samples),
+        ("solved_aux", s.solved_aux),
+        ("double_aux", s.double_aux),
+        ("wins", s.wins),
+        ("losses", s.losses),
+    ] {
+        d.set_item(k, v)?;
+    }
+    Ok(d)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  The AlphaZero engine
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Batched AlphaZero self-play / arena engine (see `src/az.rs`).
+#[pyclass(name = "AzEngine", module = "thompsonzero._core")]
+pub struct PyAzEngine {
+    inner: AnyAz,
+    #[pyo3(get)]
+    game: String,
+    #[pyo3(get)]
+    obs_shape: (usize, usize, usize),
+    #[pyo3(get)]
+    num_actions: usize,
+    #[pyo3(get)]
+    max_plies: usize,
+}
+
+#[pymethods]
+impl PyAzEngine {
+    #[new]
+    #[pyo3(signature = (game, *, num_games=512, groups=2, seed=0, sims=200, wave=4,
+        c_puct=1.5, fpu_reduction=0.2, virtual_loss=1.0, noise_alpha=10.0, noise_frac=0.25,
+        temp_threshold=20, max_plies=None, reuse_tree=true, double_aux=1, double_min_visits=8,
+        arena_games=None, external=false, openings=None, opening_plies=2, service=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        game: &str,
+        num_games: usize,
+        groups: usize,
+        seed: u64,
+        sims: usize,
+        wave: usize,
+        c_puct: f32,
+        fpu_reduction: f32,
+        virtual_loss: f32,
+        noise_alpha: f32,
+        noise_frac: f32,
+        temp_threshold: usize,
+        max_plies: Option<usize>,
+        reuse_tree: bool,
+        double_aux: usize,
+        double_min_visits: u32,
+        arena_games: Option<usize>,
+        external: bool,
+        openings: Option<Vec<Vec<u16>>>,
+        opening_plies: usize,
+        service: bool,
+    ) -> PyResult<Self> {
+        if groups == 0 || num_games < groups {
+            return Err(PyValueError::new_err("need num_games >= groups >= 1"));
+        }
+        if wave == 0 {
+            return Err(PyValueError::new_err("wave must be >= 1"));
+        }
+        if external && arena_games.is_none() {
+            return Err(PyValueError::new_err("external play needs arena_games"));
+        }
+        if service && arena_games.is_some() {
+            return Err(PyValueError::new_err("a search service plays no arena games"));
+        }
+        let mut cfg = AzConfig {
+            num_games,
+            groups,
+            seed,
+            sims,
+            wave,
+            puct: PuctCfg {
+                c_puct,
+                fpu_reduction,
+                virtual_loss,
+            },
+            noise_alpha,
+            noise_frac,
+            temp_threshold,
+            max_plies: 0,
+            reuse_tree,
+            double_aux,
+            double_min_visits,
+            arena_games,
+            external,
+            openings: openings.unwrap_or_default(),
+            opening_plies,
+            service,
+        };
+        with_game!(game, G => {
+            // an illegal opening would panic deep inside a worker thread
+            let mut legal = Vec::new();
+            for (i, seq) in cfg.openings.iter().enumerate() {
+                let mut st = G::new();
+                for &a in seq {
+                    st.legal_actions(&mut legal);
+                    if !legal.contains(&a) {
+                        return Err(PyValueError::new_err(format!("opening {i}: illegal move {a}")));
+                    }
+                    st.apply(a);
+                }
+                if st.is_terminal() {
+                    return Err(PyValueError::new_err(format!("opening {i} ends the game")));
+                }
+            }
+            cfg.max_plies = max_plies.unwrap_or(G::MAX_PLIES);
+            Ok(PyAzEngine {
+                max_plies: cfg.max_plies,
+                inner: G::wrap_az(AzEngine::<G>::new(cfg)),
+                game: G::NAME.to_string(),
+                obs_shape: obs_shape::<G>(),
+                num_actions: G::NUM_ACTIONS,
+            })
+        })
+    }
+
+    /// Search every game in `group` up to its next network evaluation.
+    /// Returns (obs float32 (rows, C, H, W), net index uint8 (rows,)).
+    fn collect<'py>(&mut self, py: Python<'py>, group: usize) -> PyResult<Batch<'py>> {
+        if group >= self.groups() {
+            return Err(PyValueError::new_err("group out of range"));
+        }
+        let inner = &mut self.inner;
+        let (obs, nets) = py.allow_threads(|| each_az!(inner, e => e.collect(group)));
+        let (c, h, w) = self.obs_shape;
+        let obs = Array4::from_shape_vec((nets.len(), c, h, w), obs).unwrap();
+        Ok((obs.into_pyarray(py), Array1::from_vec(nets).into_pyarray(py)))
+    }
+
+    /// Feed back the evaluations for the last `collect(group)`: v float32
+    /// (rows,) the mover's value in [-1, 1], logits float32 (rows,
+    /// num_actions) raw policy logits.
+    fn apply(
+        &mut self,
+        py: Python<'_>,
+        group: usize,
+        v: PyReadonlyArray1<f32>,
+        logits: PyReadonlyArray2<f32>,
+    ) -> PyResult<()> {
+        if group >= self.groups() {
+            return Err(PyValueError::new_err("group out of range"));
+        }
+        let rows = self.pending_rows(group);
+        if v.shape() != [rows] || logits.shape() != [rows, self.num_actions] {
+            return Err(PyValueError::new_err(format!(
+                "expected v ({rows},) and logits ({rows}, {}), got {:?} and {:?}",
+                self.num_actions,
+                v.shape(),
+                logits.shape()
+            )));
+        }
+        let (v, logits) = (v.as_slice()?, logits.as_slice()?);
+        let inner = &mut self.inner;
+        py.allow_threads(|| each_az!(inner, e => e.apply(group, v, logits)));
+        Ok(())
+    }
+
+    /// Every sample from games finished since the last call, as a dict of
+    /// dense numpy arrays: obs (n, C, H, W), pi (n, A), z (n,), z_w (n,).
+    fn drain<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let samples = each_az!(&mut self.inner, e => e.drain());
+        az_samples_to_dict(py, &samples, self.obs_shape, self.num_actions)
+    }
+
+    /// Arena results since the last call: [(game, net 0's player, result
+    /// for net 0)].
+    fn results(&mut self) -> Vec<(usize, u8, i8)> {
+        each_az!(&mut self.inner, e => e.take_results())
+            .into_iter()
+            .map(|r| (r.game, r.seat0, r.result))
+            .collect()
+    }
+
+    /// External mode: [(slot, GameState)] for every game where the external
+    /// opponent is to move.
+    fn waiting(&self) -> Vec<(usize, PyGameState)> {
+        each_az!(&self.inner, e => e
+            .waiting()
+            .into_iter()
+            .map(|(i, s)| (i, PyGameState { inner: Wrap::wrap_state(s) }))
+            .collect())
+    }
+
+    /// External mode: play the opponent's move in `slot`.
+    fn play_external(&mut self, slot: usize, action: u16) -> PyResult<()> {
+        each_az!(&mut self.inner, e => e.play_external(slot, action)).map_err(PyValueError::new_err)
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        stats_to_dict(py, &each_az!(&self.inner, e => e.stats().clone()))
+    }
+
+    /// Simulations per move for searches started from now on.
+    fn set_sims(&mut self, sims: usize) {
+        each_az!(&mut self.inner, e => e.set_sims(sims))
+    }
+
+    /// Arena mode: every game has been played.  Search service: every
+    /// search has finished.
+    #[getter]
+    fn done(&self) -> bool {
+        each_az!(&self.inner, e => e.done())
+    }
+
+    /// Search service: search `state` in the idle `slot`; its move comes
+    /// back from `moves` after enough collect/apply rounds.
+    fn search(&mut self, slot: usize, state: &PyGameState) -> PyResult<()> {
+        each_az!(&mut self.inner, e => search_in_az(e, slot, &state.inner))
+    }
+
+    /// Search service: [(slot, move)] of the searches finished since the
+    /// last call.
+    fn moves(&mut self) -> Vec<(usize, u16)> {
+        each_az!(&mut self.inner, e => e.moves())
+    }
+
+    #[getter]
+    fn groups(&self) -> usize {
+        each_az!(&self.inner, e => e.cfg.groups)
+    }
+}
+
+impl PyAzEngine {
+    fn pending_rows(&self, group: usize) -> usize {
+        each_az!(&self.inner, e => e.pending_rows(group))
+    }
+}
+
+fn az_samples_to_dict<'py>(
+    py: Python<'py>,
+    s: &[AzSample],
+    shape: (usize, usize, usize),
+    na: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let n = s.len();
+    let (c, h, w) = shape;
+    let mut obs = Array2::<f32>::zeros((n, c * h * w));
+    let mut pi = Array2::<f32>::zeros((n, na));
+    let mut z = Array1::<f32>::zeros(n);
+    let mut z_w = Array1::<f32>::zeros(n);
+    for (i, x) in s.iter().enumerate() {
+        obs.row_mut(i).as_slice_mut().unwrap().copy_from_slice(&x.obs);
+        for &(a, p) in &x.pi {
+            pi[[i, a as usize]] = p;
+        }
+        z[i] = x.z;
+        z_w[i] = x.z_w;
+    }
+    let out = PyDict::new(py);
+    out.set_item("obs", obs.into_shape_with_order((n, c, h, w)).unwrap().into_pyarray(py))?;
+    out.set_item("pi", pi.into_pyarray(py))?;
+    out.set_item("z", z.into_pyarray(py))?;
+    out.set_item("z_w", z_w.into_pyarray(py))?;
+    Ok(out)
+}
+
+fn report_to_dict<'py>(py: Python<'py>, r: &Report) -> PyResult<Bound<'py, PyDict>> {
+    let n = r.edges.len();
+    let mut prior = Array2::<f64>::zeros((n, 3));
+    let mut sel = Array2::<f64>::zeros((n, 3));
+    let mut acc = Array2::<f64>::zeros((n, RAW));
+    for (i, e) in r.edges.iter().enumerate() {
+        for j in 0..3 {
+            prior[[i, j]] = e.prior[j];
+            sel[[i, j]] = e.sel[j];
+        }
+        acc.row_mut(i).as_slice_mut().unwrap().copy_from_slice(&e.acc);
+    }
+    let actions: Vec<u16> = r.edges.iter().map(|e| e.action).collect();
+    let term: Vec<i8> = r.edges.iter().map(|e| e.term).collect();
+    let out = PyDict::new(py);
+    out.set_item("v_alpha", Array1::from_vec(r.v_alpha.to_vec()).into_pyarray(py))?;
+    out.set_item("node", Array1::from_vec(r.node.to_vec()).into_pyarray(py))?;
+    out.set_item("actions", Array1::from_vec(actions).into_pyarray(py))?;
+    out.set_item("term", Array1::from_vec(term).into_pyarray(py))?;
+    out.set_item("prior", prior.into_pyarray(py))?;
+    out.set_item("sel", sel.into_pyarray(py))?;
+    out.set_item("acc", acc.into_pyarray(py))?;
+    Ok(out)
 }
 
 fn samples_to_dict<'py>(
@@ -418,6 +798,14 @@ impl PyGameState {
     fn __str__(&self) -> String {
         each_state!(&self.inner, s => s.render())
     }
+
+    /// Othello only: the position in Edax's `setboard` format.
+    fn edax_board(&self) -> PyResult<String> {
+        match &self.inner {
+            AnyState::Othello(s) => Ok(s.edax_board()),
+            _ => Err(PyValueError::new_err("edax_board is only defined for othello")),
+        }
+    }
 }
 
 fn obs_size<G: Game>(_: &G) -> usize {
@@ -439,6 +827,7 @@ fn name_of<G: Game>(_: &G) -> &'static str {
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEngine>()?;
+    m.add_class::<PyAzEngine>()?;
     m.add_class::<PyGameState>()?;
     Ok(())
 }

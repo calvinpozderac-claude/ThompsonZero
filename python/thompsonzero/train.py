@@ -26,12 +26,12 @@ from collections import defaultdict
 
 import torch
 
-from . import _core, loss
+from . import _core, az, loss, symmetry
 from .arena import play_match
 from .config import Config
 from .inference import Evaluator, SelfPlay
 from .network import build
-from .replay import ReplayBuffer
+from .replay import AZ_SCHEMA, TZ_SCHEMA, ReplayBuffer
 
 
 def pick_device(pref='auto'):
@@ -41,32 +41,64 @@ def pick_device(pref='auto'):
 
 
 def make_engine(cfg, seed, sims):
+    if cfg.algo == 'az':
+        return az.make_engine(cfg, seed, sims)
     return _core.Engine(
         cfg.game, num_games=cfg.num_games, groups=cfg.groups, seed=seed, sims=sims,
         wave=cfg.wave, search=cfg.search_rule, target=cfg.target_rule,
         rho_search=cfg.rho_search, rho_target=cfg.rho_target, sample_leaf=cfg.sample_leaf,
+        best_value=cfg.best_value,
         virtual_loss=cfg.virtual_loss, descent_temp=cfg.descent_temp,
-        temp_threshold=cfg.temp_threshold, max_plies=cfg.max_plies or None,
-        double_aux=cfg.double_aux, double_min_visits=cfg.double_min_visits,
+        temp_threshold=cfg.temp_threshold, root_temp=cfg.root_temp,
+        max_plies=cfg.max_plies or None, double_aux=cfg.double_aux, double_min_visits=cfg.double_min_visits,
         solved_aux=cfg.solved_aux)
 
 
+def make_buffer(cfg, obs_shape, num_actions, device):
+    schema = AZ_SCHEMA if cfg.algo == 'az' else TZ_SCHEMA
+    return ReplayBuffer(cfg.buffer_size, obs_shape, num_actions, device, schema)
+
+
+def make_optimizer(cfg, net, device):
+    lr = cfg.lr_steps[0][1]
+    if cfg.optimizer == 'sgd':
+        return torch.optim.SGD(net.parameters(), lr=lr, momentum=cfg.momentum,
+                               weight_decay=cfg.weight_decay)
+    if cfg.optimizer == 'adamw':
+        return torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=cfg.weight_decay,
+                                 fused=device.type == 'cuda')
+    raise ValueError(f'unknown optimizer {cfg.optimizer!r}')
+
+
 def make_step(net, opt, cfg, device, buffer):
-    """One optimizer step on a replay batch; returns detached loss parts."""
-    weights = {k: float(w) for k, w in cfg.loss_weights.items() if w}
-    unknown = set(weights) - {'klv', 'kla', 'cev', 'cea', 'cons'}
-    if unknown:
-        raise ValueError(f'unknown loss components {sorted(unknown)}')
+    """One optimizer step on a replay batch; returns detached loss parts.
+    `step.eval(b)` is the same loss in eval mode, without a step."""
     amp = cfg.amp and device.type == 'cuda'
 
-    def forward_loss(b):
-        # batch positions and their successors in ONE forward pass
-        x = torch.cat([b['obs'], b['next_obs']])
-        with torch.autocast('cuda', torch.bfloat16, enabled=amp):
-            v, a = net(x)
-        n = b['obs'].shape[0]
-        return loss.compute(v[:n], a[:n], v[n:], b, weights)
+    if cfg.algo == 'az':
+        def forward_loss(b):
+            with torch.autocast('cuda', torch.bfloat16, enabled=amp):
+                v, logits = net(b['obs'])
+            return az.compute(v, logits, b, cfg.value_weight)
+    else:
+        weights = {k: float(w) for k, w in cfg.loss_weights.items() if w}
+        unknown = set(weights) - {'klv', 'kla', 'cev', 'cea', 'cons'}
+        if unknown:
+            raise ValueError(f'unknown loss components {sorted(unknown)}')
 
+        def forward_loss(b):
+            # batch positions and their successors in ONE forward pass
+            x = torch.cat([b['obs'], b['next_obs']])
+            with torch.autocast('cuda', torch.bfloat16, enabled=amp):
+                v, a = net(x)
+            n = b['obs'].shape[0]
+            return loss.compute(v[:n], a[:n], v[n:], b, weights, split=cfg.loss_split,
+                                mean_w=cfg.split_mean_weight, cal_c=cfg.cal_conc)
+
+    # Mid-run diagnostics use the eager loss: a recompile on this thread would
+    # FX-trace while the self-play thread runs its compiled network, and
+    # torch.compile does not support that.
+    eager_loss = forward_loss
     if cfg.compile and device.type == 'cuda':
         # compile + warm up now, on this thread, before self-play starts
         compiled = torch.compile(forward_loss)
@@ -80,6 +112,8 @@ def make_step(net, opt, cfg, device, buffer):
             print(f'torch.compile unavailable for training ({type(e).__name__}: {e}); using eager')
 
     def step(b):
+        if cfg.augment:
+            b = symmetry.augment(b, cfg.game)
         total, parts = forward_loss(b)
         opt.zero_grad(set_to_none=True)
         total.backward()
@@ -91,6 +125,16 @@ def make_step(net, opt, cfg, device, buffer):
         parts['skipped'] = torch.tensor(0.0 if ok else 1.0)
         return parts
 
+    @torch.no_grad()
+    def evaluate(b):
+        was = net.training
+        net.eval()
+        try:
+            return eager_loss(b)[1]
+        finally:
+            net.train(was)
+
+    step.eval = evaluate
     return step
 
 
@@ -151,9 +195,8 @@ def train(cfg: Config):
     g = _core.GameState(cfg.game)
     obs_shape, num_actions = g.obs_shape, g.num_actions
     net = build(cfg, obs_shape, num_actions).to(device)
-    opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr_steps[0][1],
-                            weight_decay=cfg.weight_decay, fused=device.type == 'cuda')
-    buffer = ReplayBuffer(cfg.buffer_size, obs_shape, num_actions, device)
+    opt = make_optimizer(cfg, net, device)
+    buffer = make_buffer(cfg, obs_shape, num_actions, device)
     episode = steps = 0
 
     if os.path.exists(run.path('latest.pt')):
@@ -180,9 +223,13 @@ def train(cfg: Config):
         benchmark()
 
     n_params = sum(p.numel() for p in net.parameters())
-    run.log(f'{cfg.game}: {n_params:,} params on {device} | search={cfg.search_rule} '
-            f'target={cfg.target_rule} | {cfg.num_games} games x wave {cfg.wave} '
-            f'| episodes {episode}/{cfg.episodes}')
+    if cfg.algo == 'az':
+        algo = (f'alphazero {cfg.channels}ch x {cfg.blocks} c_puct={cfg.c_puct} '
+                f'fpu={cfg.fpu_reduction} {cfg.optimizer} augment={cfg.augment}')
+    else:
+        algo = f'search={cfg.search_rule} target={cfg.target_rule}'
+    run.log(f'{cfg.game}: {n_params:,} params on {device} | {algo} '
+            f'| {cfg.num_games} games x wave {cfg.wave} | episodes {episode}/{cfg.episodes}')
 
     step = make_step(net, opt, cfg, device, buffer)
     evaluator = Evaluator(net, device, cfg.amp, cfg.compile and device.type == 'cuda')
@@ -193,6 +240,7 @@ def train(cfg: Config):
 
     acc = defaultdict(float)
     n_acc = 0
+    gap = defaultdict(list)
     owed = 0.0
     window = dict(t=time.time(), episode=episode, steps=steps, stats=None)
     try:
@@ -203,8 +251,16 @@ def train(cfg: Config):
                 samples, games = selfplay.out.get(timeout=1.0)
             except queue.Empty:
                 continue
-            buffer.add(samples)
+            rows = buffer.add(samples)
             prev, episode = episode, episode + games
+            if cfg.fresh_eval_every and episode // cfg.fresh_eval_every > prev // cfg.fresh_eval_every:
+                # generalisation gap: loss on games not yet trained on vs on
+                # replay data, both in eval mode
+                fresh = step.eval(buffer.gather(rows[:cfg.batch_size]))
+                seen = step.eval(buffer.sample(cfg.batch_size, gen))
+                for k in fresh.keys() & {'loss', 'value', 'policy', 'klv', 'cev'}:
+                    gap['fresh_' + k].append(float(fresh[k]))
+                    gap['seen_' + k].append(float(seen[k]))
             selfplay.sims = cfg.sims_at(episode)
             for g in opt.param_groups:
                 g['lr'] = cfg.lr_at(episode)
@@ -214,7 +270,7 @@ def train(cfg: Config):
                 owed = 0.0
             net.train()
             while owed >= 1.0:
-                parts = step(buffer.sample(cfg.batch_size, gen))
+                parts = step(buffer.sample(cfg.batch_size, gen, cfg.window_at(episode)))
                 for k, v in parts.items():
                     acc[k] += v           # stays on device until logged
                 n_acc += 1
@@ -227,8 +283,8 @@ def train(cfg: Config):
                 return every and episode // every > prev // every
 
             if crossed(cfg.log_every):
-                window = _log(run, cfg, episode, steps, buffer, acc, n_acc, selfplay, window, opt)
-                acc, n_acc = defaultdict(float), 0
+                window = _log(run, cfg, episode, steps, buffer, acc, n_acc, gap, selfplay, window, opt)
+                acc, n_acc, gap = defaultdict(float), 0, defaultdict(list)
             if crossed(cfg.benchmark_every):
                 benchmark()
                 checkpoint(with_buffer=True)
@@ -243,13 +299,14 @@ def train(cfg: Config):
     return net
 
 
-def _log(run, cfg, episode, steps, buffer, acc, n_acc, selfplay, window, opt):
+def _log(run, cfg, episode, steps, buffer, acc, n_acc, gap, selfplay, window, opt):
     now = time.time()
     dt = max(now - window['t'], 1e-9)
     st = dict(selfplay.stats or {})
     prev = window['stats'] or {k: 0 for k in st}
     d = {k: st.get(k, 0) - prev.get(k, 0) for k in st}
     m = {k: float(v) / max(n_acc, 1) for k, v in acc.items()}
+    m.update({k: sum(v) / len(v) for k, v in gap.items() if v})
     games = max(d.get('games', 0), 1)
     rec = dict(episode=episode, steps=steps, time=now, lr=opt.param_groups[0]['lr'],
                buffer=len(buffer), sims=cfg.sims_at(episode),
@@ -259,11 +316,24 @@ def _log(run, cfg, episode, steps, buffer, acc, n_acc, selfplay, window, opt):
                plies=d.get('plies', 0) / games, draws=d.get('draws', 0) / games,
                aux_solved=d.get('solved_aux', 0) / games, **m)
     run.metrics(rec)
-    w = cfg.loss_weights
-    terms = ' '.join(f'{k} {m.get(k, float("nan")):.3f}' for k in ('klv', 'kla', 'cev', 'cea', 'cons') if w.get(k))
-    run.log(f'ep {episode:7d} | loss {m.get("loss", float("nan")):.3f} ({terms}) '
-            f'| conc v {m.get("v_conc", 0):.1f}/{m.get("v_conc_tgt", 0):.1f} '
-            f'a {m.get("a_conc", 0):.1f}/{m.get("a_conc_tgt", 0):.1f} '
+    if cfg.algo == 'az':
+        terms = (f'loss {m.get("loss", float("nan")):.3f} (value {m.get("value", 0):.3f} '
+                 f'policy {m.get("policy", 0):.3f} | pi entropy {m.get("pi_entropy", 0):.3f}) '
+                 f'| |v| {m.get("v_mean_abs", 0):.2f} doubles {d.get("double_aux", 0) / games:.0f}/game')
+    else:
+        w = cfg.loss_weights
+        terms = ' '.join(f'{k} {m.get(k, float("nan")):.3f}' for k in ('klv', 'kla', 'cev', 'cea', 'cons') if w.get(k))
+        terms = (f'loss {m.get("loss", float("nan")):.3f} ({terms}) '
+                 f'| conc v {m.get("v_conc", 0):.1f}/{m.get("v_conc_tgt", 0):.1f} '
+                 f'a {m.get("a_conc", 0):.1f}/{m.get("a_conc_tgt", 0):.1f}')
+        if 'v_cal' in m:
+            terms += (f' | cal v {m["v_cal"]:.0f} a {m["a_cal"]:.0f} '
+                      f'(kl {m.get("calv", 0):.2f}/{m.get("cala", 0):.2f})')
+    if 'fresh_loss' in m:
+        k = ('value', 'policy') if cfg.algo == 'az' else ('klv', 'cev')
+        terms += (f' | fresh/replay {k[0]} {m.get("fresh_" + k[0], 0):.3f}/{m.get("seen_" + k[0], 0):.3f} '
+                  f'{k[1]} {m.get("fresh_" + k[1], 0):.3f}/{m.get("seen_" + k[1], 0):.3f}')
+    run.log(f'ep {episode:7d} | {terms} '
             f'| {rec["games_per_s"]:.2f} games/s {rec["steps_per_s"]:.1f} steps/s '
             f'{rec["evals_per_s"] / 1000:.1f}k evals/s | ply {rec["plies"]:.0f} '
             f'draw {100 * rec["draws"]:.0f}% | sims {rec["sims"]} buf {len(buffer) // 1000}k '
@@ -279,5 +349,6 @@ def _quick_eval(run, cfg, net, device, episode):
     ref, _ = load_net(run.path(f'bench_{label}.pt'), device)
     cur = copy.deepcopy(net).eval()
     evs = [Evaluator(cur, device, cfg.amp), Evaluator(ref, device, cfg.amp)]
-    w, d, l = play_match(cfg, evs, cfg.quick_eval_games, sims=0, seed=episode)
+    match = az.play_match if cfg.algo == 'az' else play_match
+    w, d, l = match(cfg, evs, cfg.quick_eval_games, sims=0, seed=episode)
     run.log(f'         vs bench_{label} (no search): W{w} D{d} L{l}')

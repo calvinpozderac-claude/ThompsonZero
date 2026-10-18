@@ -167,6 +167,8 @@ pub struct Acc {
     pub sv: Dir,
     /// Σ α₀
     pub sa: f64,
+    /// Σ α₀ m (the leaves' own alphas, pooled)
+    pub sam: Dir,
     /// Σ sqrt(total variance) — `corr` only
     pub st: f64,
     /// Σ log m and the warm-started MLE — `additive_mle` only
@@ -183,6 +185,7 @@ impl Default for Acc {
             sq: [0.0; 3],
             sv: [0.0; 3],
             sa: 0.0,
+            sam: [0.0; 3],
             st: 0.0,
             lsum: [0.0; 3],
             mle: [1.0; 3],
@@ -190,6 +193,9 @@ impl Default for Acc {
         }
     }
 }
+
+/// Length of [`Acc::raw`].
+pub const RAW: usize = 21;
 
 const MLE_FLOOR: f64 = 1e-9;
 /// Refresh the MLE when n reaches n * GROWTH (~23 refreshes over 400 sims).
@@ -204,6 +210,7 @@ impl Acc {
             self.sm[j] += o.m[j];
             self.sq[j] += o.m[j] * o.m[j];
             self.sv[j] += o.v[j];
+            self.sam[j] += o.a0 * o.m[j];
         }
         self.sa += o.a0;
         if track.corr {
@@ -221,6 +228,22 @@ impl Acc {
                 self.refresh_mle();
             }
         }
+    }
+
+    /// Every statistic flattened, for reports: n, Σm, Σm², Σv, Σα₀, Σα₀m,
+    /// Σ sqrt(total variance), Σ log m, the current MLE.
+    pub fn raw(&self) -> [f64; RAW] {
+        let mut r = [0.0; RAW];
+        r[0] = self.n;
+        r[1..4].copy_from_slice(&self.sm);
+        r[4..7].copy_from_slice(&self.sq);
+        r[7..10].copy_from_slice(&self.sv);
+        r[10] = self.sa;
+        r[11..14].copy_from_slice(&self.sam);
+        r[14] = self.st;
+        r[15..18].copy_from_slice(&self.lsum);
+        r[18..21].copy_from_slice(&self.mle);
+        r
     }
 
     /// Minka's fixed point for the Dirichlet MLE of the observed means:
@@ -254,6 +277,18 @@ pub enum Rule {
     AdditiveMle,
     /// Direction = mean of leaf means, concentration = mean leaf α₀.
     AvgConc,
+    /// α = k Σ m_i: `Additive` with each simulation worth k observations.
+    Scaled { k: f64 },
+    /// α = Σ α_i: the leaves' own Dirichlets pooled as pseudo-counts, so a
+    /// leaf weighs its network concentration.
+    SumConc,
+    /// α = n × the `AdditiveMle` fit: the posterior of the MEAN of leaves
+    /// that scatter like the fit (concentration grows with visits).
+    MeanMle,
+    /// Direction = mean of leaf means, concentration fixed at c: a point
+    /// target, so the network's concentration is learned from how far its
+    /// mean lands from the search's.
+    Point { c: f64 },
     /// Correlated-error posterior: network prior and search mean are two
     /// estimators with error correlation ρ, combined by generalised least
     /// squares and moment-matched to a Dirichlet.
@@ -267,18 +302,29 @@ impl Rule {
             "additive" => Rule::Additive,
             "additive_mle" => Rule::AdditiveMle,
             "avgconc" => Rule::AvgConc,
+            "sumconc" => Rule::SumConc,
+            "mean_mle" => Rule::MeanMle,
+            "point" => Rule::Point { c: TERMINAL_CONC },
             "corr" => Rule::Corr { rho },
             _ => {
-                return Err(format!(
-                    "unknown evidence rule {name:?}; expected mixture | additive | additive_mle | avgconc | corr"
-                ))
+                let num = |prefix: &str| name.strip_prefix(prefix).and_then(|k| k.parse::<f64>().ok());
+                match (num("additive_x"), num("point_")) {
+                    (Some(k), _) if k > 0.0 => Rule::Scaled { k },
+                    (_, Some(c)) if c > 0.0 => Rule::Point { c },
+                    _ => {
+                        return Err(format!(
+                            "unknown evidence rule {name:?}; expected mixture | additive | additive_x<k> | \
+                             additive_mle | mean_mle | avgconc | sumconc | point | point_<c> | corr"
+                        ))
+                    }
+                }
             }
         })
     }
 
     pub fn track(&self) -> Track {
         Track {
-            mle: *self == Rule::AdditiveMle,
+            mle: matches!(self, Rule::AdditiveMle | Rule::MeanMle),
             corr: matches!(self, Rule::Corr { .. }),
         }
     }
@@ -292,7 +338,14 @@ impl Rule {
         let fl = |a: Dir| [a[0].max(ALPHA_FLOOR), a[1].max(ALPHA_FLOOR), a[2].max(ALPHA_FLOOR)];
         Some(match self {
             Rule::AdditiveMle if n >= 3.0 => fl(acc.mle),
-            Rule::Additive | Rule::AdditiveMle => fl(acc.sm),
+            Rule::MeanMle if n >= 3.0 => fl([acc.mle[0] * n, acc.mle[1] * n, acc.mle[2] * n]),
+            Rule::Additive | Rule::AdditiveMle | Rule::MeanMle => fl(acc.sm),
+            Rule::Scaled { k } => fl([acc.sm[0] * k, acc.sm[1] * k, acc.sm[2] * k]),
+            Rule::SumConc => fl(acc.sam),
+            Rule::Point { c } => {
+                let k = c / n;
+                fl([acc.sm[0] * k, acc.sm[1] * k, acc.sm[2] * k])
+            }
             Rule::AvgConc => {
                 let k = acc.sa / n / n; // (SM/n) * (SA/n)
                 fl([acc.sm[0] * k, acc.sm[1] * k, acc.sm[2] * k])
@@ -561,6 +614,21 @@ mod tests {
         let tot: f64 = got.iter().sum();
         assert!((tot - 6.0).abs() < 1e-12); // mean of 4 and 8
         assert!((got[0] / tot - (0.5 + 0.125) / 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn new_rules_concentrations() {
+        let track = Track { mle: true, corr: false };
+        let leaves = [[2.0, 1.0, 1.0], [1.0, 1.0, 6.0], [3.0, 3.0, 2.0]];
+        let acc = acc_of(&leaves, track);
+        let tot = |r: &str| Rule::parse(r, 0.8).unwrap().observed(&acc).unwrap().iter().sum::<f64>();
+        assert!((tot("additive_x16") - 48.0).abs() < 1e-9);
+        assert!((tot("sumconc") - 20.0).abs() < 1e-9); // 4 + 8 + 8
+        assert!((tot("point") - TERMINAL_CONC).abs() < 1e-9);
+        assert!((tot("point_30") - 30.0).abs() < 1e-9);
+        let mle: f64 = Rule::AdditiveMle.observed(&acc).unwrap().iter().sum();
+        assert!((tot("mean_mle") - 3.0 * mle).abs() < 1e-9);
+        assert!(Rule::parse("additive_x0", 0.8).is_err() && Rule::parse("nope", 0.8).is_err());
     }
 
     #[test]

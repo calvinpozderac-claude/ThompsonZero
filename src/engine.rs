@@ -18,6 +18,11 @@
 //! the network of the player whose move is being searched, the move is the
 //! greedy posterior pick, trees are not reused across moves (each side
 //! searches with its own network only), and results are tallied for net 0.
+//!
+//! As a SEARCH SERVICE the engine has no games of its own: `search(slot,
+//! state)` hands a slot a position, the slot searches it with net 0 and its
+//! arena pick comes back from `moves`.  Matches between different engines
+//! (`python/thompsonzero/arena.py`) are driven this way.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -26,7 +31,7 @@ use rayon::prelude::*;
 
 use crate::belief::{outcome_index, Rule};
 use crate::games::Game;
-use crate::tree::{Eval, SearchCfg, Selected, Tree};
+use crate::tree::{Eval, Report, SearchCfg, Selected, Tree};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -42,6 +47,8 @@ pub struct Config {
     pub descent_temp: f64,
     /// Self-play: Thompson-pick the move for this many plies, greedy after.
     pub temp_threshold: usize,
+    /// Self-play: those picks draw from Dir(root_temp * α) of the root edges.
+    pub root_temp: f64,
     pub max_plies: usize,
     /// Self-play: also emit targets for this many most-visited unplayed root
     /// children per move (OLIVAW's "doubling"), if visited at least
@@ -54,6 +61,10 @@ pub struct Config {
     pub arena_games: Option<usize>,
     /// Arena: uniformly random opening plies for variety.
     pub opening_plies: usize,
+    /// Search service (see the module docs).
+    pub service: bool,
+    /// Search service: also keep a [`Report`] of each searched root.
+    pub report: bool,
 }
 
 impl Config {
@@ -69,16 +80,26 @@ impl Config {
                 target,
                 sample_leaf: false,
                 virtual_loss: 1.0,
+                track_all: false,
+                best_value: false,
             },
             descent_temp: 1.0,
             temp_threshold: 20,
+            root_temp: 1.0,
             max_plies: usize::MAX,
             double_aux: 1,
             double_min_visits: 8.0,
             solved_aux: true,
             arena_games: None,
             opening_plies: 2,
+            service: false,
+            report: false,
         }
+    }
+
+    /// Self-play (as opposed to arena play or a search service).
+    pub fn selfplay(&self) -> bool {
+        self.arena_games.is_none() && !self.service
     }
 }
 
@@ -123,7 +144,7 @@ pub struct Stats {
 }
 
 impl Stats {
-    fn merge(&mut self, o: &Stats) {
+    pub(crate) fn merge(&mut self, o: &Stats) {
         self.games += o.games;
         self.plies += o.plies;
         self.draws += o.draws;
@@ -152,6 +173,9 @@ struct Slot<G> {
     ply: usize,
     /// Arena: which net plays player 0.
     seat0: u8,
+    /// Search service: the move found, until `moves` takes it.
+    moved: Option<u16>,
+    report: Option<Report>,
     rng: SmallRng,
     hist: Vec<Sample>,
     aux: Vec<Sample>,
@@ -188,6 +212,8 @@ impl<G: Game> Engine<G> {
                 done: 0,
                 ply: 0,
                 seat0: 0,
+                moved: None,
+                report: None,
                 rng: SmallRng::seed_from_u64(cfg.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ i as u64),
                 hist: Vec::new(),
                 aux: Vec::new(),
@@ -306,6 +332,46 @@ impl<G: Game> Engine<G> {
     pub fn done(&self) -> bool {
         self.slots.iter().all(|s| !s.active)
     }
+
+    /// Search service: search `state` in `slot` (which must be idle).
+    pub fn search(&mut self, slot: usize, state: G) -> Result<(), String> {
+        if !self.cfg.service {
+            return Err("not a search service".into());
+        }
+        let s = self.slots.get_mut(slot).ok_or("slot out of range")?;
+        if s.active || s.moved.is_some() {
+            return Err(format!("slot {slot} is busy"));
+        }
+        if state.is_terminal() {
+            return Err("cannot search a finished game".into());
+        }
+        s.tree.clear();
+        s.state = state;
+        s.sims = self.cfg.sims;
+        s.done = 0;
+        s.active = true;
+        Ok(())
+    }
+
+    /// Search service: (slot, move) of every search finished since the
+    /// last call; those slots are idle again.
+    pub fn moves(&mut self) -> Vec<(usize, u16)> {
+        self.slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, s)| s.moved.take().map(|a| (i, a)))
+            .collect()
+    }
+
+    /// Search service with `report`: (slot, report) of every search finished
+    /// since the last call.
+    pub fn reports(&mut self) -> Vec<(usize, Report)> {
+        self.slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, s)| s.report.take().map(|r| (i, r)))
+            .collect()
+    }
 }
 
 impl<G: Game> Slot<G> {
@@ -317,6 +383,10 @@ impl<G: Game> Slot<G> {
         self.ply = 0;
         self.hist.clear();
         self.aux.clear();
+        if cfg.service {
+            self.active = false; // until `search`
+            return;
+        }
         let Some(total) = cfg.arena_games else {
             self.active = true;
             return;
@@ -359,7 +429,7 @@ impl<G: Game> Slot<G> {
                 Selected::Terminal => {
                     self.solved.clear();
                     self.tree.propagate_solved(&self.path, sc, &mut self.solved);
-                    if cfg.solved_aux && cfg.arena_games.is_none() {
+                    if cfg.solved_aux && cfg.selfplay() {
                         for i in 0..self.solved.len() {
                             let n = self.solved[i];
                             let out = self.tree.solved(n).unwrap();
@@ -426,6 +496,16 @@ impl<G: Game> Slot<G> {
         if self.tree.is_empty() || (self.done < self.sims && self.tree.solved(0).is_none()) {
             return;
         }
+        if cfg.service {
+            let idx = self.tree.pick(&mut self.rng, None);
+            self.moved = Some(self.tree.edges_of(0)[idx].action);
+            if cfg.report {
+                self.report = Some(self.tree.report());
+            }
+            self.tree.clear();
+            self.active = false;
+            return;
+        }
         self.play_move(cfg);
         if self.state.is_terminal() || self.ply >= cfg.max_plies {
             self.finish(cfg);
@@ -457,9 +537,9 @@ impl<G: Game> Slot<G> {
     }
 
     fn play_move(&mut self, cfg: &Config) {
-        let selfplay = cfg.arena_games.is_none();
+        let selfplay = cfg.selfplay();
         let thompson = selfplay && self.ply < cfg.temp_threshold;
-        let idx = self.tree.pick(&mut self.rng, thompson);
+        let idx = self.tree.pick(&mut self.rng, thompson.then_some(cfg.root_temp));
         let action = self.tree.edges_of(0)[idx].action;
         let mover = self.state.current_player();
         if selfplay {
@@ -617,6 +697,37 @@ mod tests {
             assert_eq!(e.stats().games as usize, n);
             assert!(e.drain().is_empty());
         }
+    }
+
+    #[test]
+    fn service_searches_given_positions() {
+        let mut cfg = selfplay_cfg("additive_mle");
+        cfg.service = true;
+        cfg.num_games = 3;
+        cfg.groups = 1;
+        let mut e = Engine::<Othello>::new(cfg);
+        assert!(e.done());
+        let mut st = Othello::new();
+        st.apply(37);
+        let mut legal = Vec::new();
+        st.legal_actions(&mut legal);
+        e.search(2, st.clone()).unwrap();
+        assert!(e.search(2, st.clone()).is_err());
+        let mut got = Vec::new();
+        let mut guard = 0;
+        while got.is_empty() {
+            let (_o, nets) = e.collect(0);
+            let (v, a) = uniform::<Othello>(nets.len());
+            e.apply(0, &v, &a);
+            got = e.moves();
+            guard += 1;
+            assert!(guard < 1000);
+        }
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 2);
+        assert!(legal.contains(&got[0].1));
+        assert!(e.done() && e.drain().is_empty());
+        e.search(2, st).unwrap(); // idle again
     }
 
     #[test]
