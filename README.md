@@ -64,6 +64,10 @@ outweighs the now-confident prior (`search_rule=point_400`).  At evaluation
 whose Edax scores at 1000 sims rise to 85% / 55% / 26% / 8% (channel fitted
 post hoc on its replay buffer).  Calibrated search in SELF-PLAY trained
 weaker nets (-65 to -150 Elo at 10k), so self-play keeps the temperatures.
+The `tz` preset therefore learns the channel on the side and reads it only
+in matches (`eval_cal_search`, `eval_search_rule=point_400`,
+`eval_descent_temp=4`), and draws its opening moves from Dir(1024 α)
+(`root_temp`, +110-180 Elo over 1 at 10k).
 
 The research recipe (`corr`, and every `Config` default): 64ch x 10 SE
 blocks, AdamW, sims 100 -> 200 -> 400 in thirds, 6 optimizer steps of batch

@@ -37,13 +37,20 @@ BASELINE = dict(
 #         the Oct 2026 sweeps (10k episodes, head-to-head vs an AlphaZero net
 #         trained identically): in-tree descent sharpened to Dir(32 alpha) in
 #         self-play (+90 Elo over 1, while near-greedy 1000 lost exploration)
-#         and to Dir(1000 alpha) in matches (+150-260 Elo at play time).
+#         and to Dir(1000 alpha) in matches (+150-260 Elo at play time);
+#         opening moves drawn from Dir(1024 alpha) (+110-180 over 1).  A
+#         calibrated-concentration channel learned on the side (cal_conc)
+#         is read only in matches, with point_400 evidence at Dir(4 alpha):
+#         +40 Elo at 10k, +111 on the 50k net (calibrated self-play lost
+#         ~100 Elo, so self-play keeps the search above).
 #   corr  the research recipe of record (64ch SE trunk, AdamW, 6 steps per
 #         game): search corr + target corr, rho 0.8 / 0.999 (CORR-TZ)
 RULES = {
     'az': dict(algo='az', **BASELINE),
     'tz': dict(search_rule='additive_mle', target_rule='avgconc',
-               descent_temp=32.0, eval_descent_temp=1000.0, **BASELINE),
+               descent_temp=32.0, root_temp=1024.0, cal_conc=1000.0,
+               eval_cal_search=True, eval_search_rule='point_400', eval_descent_temp=4.0,
+               **BASELINE),
     'corr': dict(search_rule='corr', target_rule='corr', rho_search=0.8, rho_target=0.999),
 }
 
@@ -72,6 +79,8 @@ class Config:
     virtual_loss: float = 1.0
     descent_temp: float = 1.0             # in-tree sampling from Dir(temp * alpha)
     eval_descent_temp: float = 0.0        # the same in matches (arena, league, Edax); 0 = descent_temp
+    eval_search_rule: str = ''            # search_rule in matches; '' = search_rule
+    eval_cal_search: bool = False         # matches read the calibrated channel (see cal_conc)
     # ((fraction of run, sims per move), ...): 100 -> 200 -> 400 in thirds
     sims_ramp: tuple = ((0.0, 100), (1 / 3, 200), (2 / 3, 400))
     temp_threshold: int = 20              # Thompson-sampled moves, then greedy

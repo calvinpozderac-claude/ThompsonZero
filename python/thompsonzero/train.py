@@ -171,12 +171,15 @@ class Run:
 
 
 def load_net(path, device='cpu'):
-    """Rebuild a saved network (benchmark or latest checkpoint)."""
+    """Rebuild a saved network (benchmark or latest checkpoint), set up for
+    matches (`eval_cal_search`)."""
     ck = torch.load(path, map_location='cpu', weights_only=False)
     cfg = Config.from_dict(ck['config'])
     g = _core.GameState(cfg.game)
     net = build(cfg, g.obs_shape, g.num_actions)
     net.load_state_dict(ck['model'])
+    if cfg.algo != 'az':
+        net.use_cal = cfg.cal_search or cfg.eval_cal_search
     return net.to(device).eval(), cfg
 
 

@@ -344,6 +344,25 @@ def test_cal_channel_learns_on_the_side():
     assert torch.allclose(cal, torch.exp(v[:, 4])) and not torch.allclose(own, cal)
 
 
+def test_tz_preset_matches_use_the_calibrated_search(tmp_path):
+    """The tz preset learns the calibrated channel on the side: self-play
+    leaves it off, a saved net loads with it on, and matches search with the
+    eval rule."""
+    from thompsonzero.arena import eval_search_rule
+    from thompsonzero.train import load_net
+    cfg = preset('othello', 'tz', channels=8, blocks=1)
+    g = GameState('othello')
+    net = build(cfg, g.obs_shape, g.num_actions)
+    assert net.cal and not net.use_cal and eval_search_rule(cfg) == 'point_400'
+    path = str(tmp_path / 'bench.pt')
+    torch.save(dict(config=json.loads(cfg.to_json()), model=net.state_dict()), path)
+    loaded, lcfg = load_net(path)
+    assert loaded.use_cal
+    evs = [Evaluator(loaded, 'cpu', amp=False)] * 2
+    w, d, l = play_match(lcfg, evs, games=4, sims=16)
+    assert w + d + l == 4
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
 def test_evaluator_first_batch_sees_the_weights():
     """A fresh Evaluator's first batch must see the copied weights: the copy

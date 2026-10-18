@@ -31,7 +31,7 @@ def play_match(cfg, evaluators, games, sims, seed=0, opening_plies=2):
     (wins, draws, losses) for evaluators[0]."""
     eng = _core.Engine(
         cfg.game, num_games=min(games, 512), groups=1, seed=seed, sims=sims, wave=4,
-        search=cfg.search_rule, target=cfg.target_rule, rho_search=cfg.rho_search,
+        search=eval_search_rule(cfg), target=cfg.target_rule, rho_search=cfg.rho_search,
         rho_target=cfg.rho_target, virtual_loss=cfg.virtual_loss,
         descent_temp=eval_descent_temp(cfg), max_plies=cfg.max_plies or None,
         arena_games=games, opening_plies=opening_plies)
@@ -47,6 +47,11 @@ def eval_descent_temp(cfg):
     return cfg.eval_descent_temp or cfg.descent_temp
 
 
+def eval_search_rule(cfg):
+    """TZ's evidence rule in matches."""
+    return cfg.eval_search_rule or cfg.search_rule
+
+
 def search_engine(cfg, slots, sims, seed=0):
     """`cfg`'s search (TZ or AZ, as at evaluation time) as a search service
     with `slots` slots: `search(slot, state)`, collect/apply, `moves()`."""
@@ -54,7 +59,7 @@ def search_engine(cfg, slots, sims, seed=0):
         return az.make_engine(cfg, seed, sims, slots=slots, service=True)
     return _core.Engine(
         cfg.game, num_games=slots, groups=1, seed=seed, sims=sims, wave=cfg.wave,
-        search=cfg.search_rule, target=cfg.target_rule, rho_search=cfg.rho_search,
+        search=eval_search_rule(cfg), target=cfg.target_rule, rho_search=cfg.rho_search,
         rho_target=cfg.rho_target, virtual_loss=cfg.virtual_loss,
         descent_temp=eval_descent_temp(cfg), max_plies=cfg.max_plies or None, service=True)
 
