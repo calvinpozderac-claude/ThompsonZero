@@ -176,12 +176,16 @@ class AZResBlock(nn.Module):
 
 
 class AZNet(nn.Module):
-    """forward(x) -> (v (B,) in [-1, 1] for the mover, logits (B, A))."""
+    """forward(x) -> (v, logits (B, A)) for the mover: v (B,) in [-1, 1],
+    or with `wdl` (B, 3) win/draw/loss logits, read by the search as
+    p_win - p_loss (`postprocess`)."""
 
-    def __init__(self, obs_shape, num_actions, channels=128, blocks=10, value_hidden=256):
+    def __init__(self, obs_shape, num_actions, channels=128, blocks=10, value_hidden=256,
+                 wdl=False):
         super().__init__()
         c, h, w = obs_shape
         self.obs_shape, self.num_actions = tuple(obs_shape), num_actions
+        self.wdl = wdl
         self.stem = nn.Sequential(nn.Conv2d(c, channels, 3, padding=1, bias=False),
                                   nn.BatchNorm2d(channels), nn.ReLU(inplace=True))
         self.trunk = nn.Sequential(*[AZResBlock(channels) for _ in range(blocks)])
@@ -191,15 +195,18 @@ class AZNet(nn.Module):
         self.value = nn.Sequential(
             nn.Conv2d(channels, 1, 1, bias=False), nn.BatchNorm2d(1), nn.ReLU(inplace=True),
             nn.Flatten(), nn.Linear(h * w, value_hidden), nn.ReLU(inplace=True),
-            nn.Linear(value_hidden, 1), nn.Tanh())
+            *((nn.Linear(value_hidden, 3),) if wdl else (nn.Linear(value_hidden, 1), nn.Tanh())))
 
     def forward(self, x):
         t = self.trunk(self.stem(x))
-        return self.value(t).squeeze(1), self.policy(t)
+        v = self.value(t)
+        return (v if self.wdl else v.squeeze(1)), self.policy(t)
 
-    @staticmethod
-    def postprocess(v, logits):
+    def postprocess(self, v, logits):
         """-> (v (B,), logits (B, A)) as fp32, for `AzEngine.apply`."""
+        if self.wdl:
+            p = torch.softmax(v.float(), dim=-1)
+            return p[:, 0] - p[:, 2], logits.float()
         return v.float(), logits.float()
 
     def empty_outputs(self):
@@ -208,7 +215,10 @@ class AZNet(nn.Module):
 
 def build(cfg, obs_shape, num_actions):
     if cfg.algo == 'az':
-        return AZNet(obs_shape, num_actions, cfg.channels, cfg.blocks)
+        if cfg.value_head not in ('scalar', 'wdl'):
+            raise ValueError(f'unknown value_head {cfg.value_head!r}')
+        return AZNet(obs_shape, num_actions, cfg.channels, cfg.blocks,
+                     wdl=cfg.value_head == 'wdl')
     net = DirichletNet(obs_shape, num_actions, cfg.channels, cfg.blocks, cfg.head_channels,
                        cfg.trunk, cal=cfg.cal_conc > 0)
     net.use_cal = cfg.cal_search

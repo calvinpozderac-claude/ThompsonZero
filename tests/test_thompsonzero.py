@@ -378,3 +378,28 @@ def test_evaluator_first_batch_sees_the_weights():
         want = ref.evaluate(obs)[0]
         got = Evaluator(net, 'cuda', amp=True).evaluate(obs)[0]
         assert np.array_equal(got, want)
+
+
+def test_wdl_value_head():
+    """value_head=wdl: three logits per position, trained by cross-entropy to
+    (win, draw, loss) with mean z, and handed to the search as p_win - p_loss."""
+    from thompsonzero import az
+    cfg = preset('othello', 'az', channels=8, blocks=1, value_head='wdl')
+    g = GameState('othello')
+    net = build(cfg, g.obs_shape, g.num_actions).eval()
+    x = torch.randn(4, *g.obs_shape)
+    v, logits = net(x)
+    assert v.shape == (4, 3)
+    sv, _ = net.postprocess(v, logits)
+    p = torch.softmax(v, -1)
+    assert torch.allclose(sv, p[:, 0] - p[:, 2])
+    z = torch.tensor([1.0, 0.0, -1.0, 0.5])
+    assert torch.allclose(az.wdl_target(z), torch.tensor(
+        [[1.0, 0, 0], [0, 1, 0], [0, 0, 1], [0.5, 0.5, 0]]))
+    b = dict(z=z, z_w=torch.ones(4), pi=torch.full((4, g.num_actions), 1 / g.num_actions))
+    total, parts = az.compute(v, logits, b)
+    total.backward()
+    assert torch.isfinite(total) and parts['value'] > 0
+    evs = [Evaluator(net, 'cpu', amp=False)] * 2
+    w, d, l = az.play_match(cfg, evs, games=4, sims=16)
+    assert w + d + l == 4

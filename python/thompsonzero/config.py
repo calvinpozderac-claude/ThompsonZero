@@ -96,6 +96,8 @@ class Config:
     noise_alpha: float = 10.0             # root Dir(min(1, 10 / legal moves))
     noise_frac: float = 0.25
     reuse_tree: bool = True
+    value_head: str = 'scalar'            # scalar (tanh, MSE to z) | wdl (win/draw/loss softmax,
+                                          # CE; the search reads p_win - p_loss)
 
     # ── self-play engine ────────────────────────────────────────────────────
     num_games: int = 1024                 # concurrent games (all CPU cores share them)

@@ -8,6 +8,9 @@ the loss
 
     L = (z - v)^2 - pi . log p + c ||theta||^2         (c in the optimizer)
 
+or, with `value_head=wdl`, a win/draw/loss cross-entropy in place of the
+squared error (see `compute`).
+
 trained with SGD + momentum 0.9 on a step schedule (OLIVAW's shape, 30x its
 LR, and 3 steps per game rather than ~6: see the `az` entry of RULES).
 Training positions are augmented with a random one of the eight board
@@ -36,11 +39,26 @@ def make_engine(cfg, seed, sims, slots=None, **arena):
         double_min_visits=int(cfg.double_min_visits), **kw, **arena)
 
 
+def wdl_target(z):
+    """z in [-1, 1] -> (win, draw, loss) with mean z: exact for game results,
+    and a doubled sample's q splits between draw and its sign."""
+    return torch.stack([z.clamp_min(0), 1 - z.abs(), (-z).clamp_min(0)], -1)
+
+
 def compute(v, logits, b, value_weight=1.0):
-    """Mean (z - v)^2 over valued rows plus the policy cross-entropy over
-    rows with a search target.  Returns (total, dict of detached scalars)."""
+    """Mean (z - v)^2 over valued rows -- or with (B, 3) win/draw/loss
+    logits, their cross-entropy to `wdl_target(z)` -- plus the policy
+    cross-entropy over rows with a search target.  Returns (total, dict of
+    detached scalars)."""
     zw = b['z_w']
-    mse = (zw * (v.float() - b['z']) ** 2).sum() / zw.sum().clamp_min(1.0)
+    z = b['z'].float()
+    if v.dim() == 2:
+        logq = torch.log_softmax(v.float(), dim=-1)
+        err = -(wdl_target(z) * logq).sum(-1)
+        v = logq.exp()[:, 0] - logq.exp()[:, 2]
+    else:
+        err = (v.float() - z) ** 2
+    mse = (zw * err).sum() / zw.sum().clamp_min(1.0)
     pi = b['pi']
     has_pi = (pi.sum(-1) > 0).float()
     logp = torch.log_softmax(logits.float(), dim=-1)
