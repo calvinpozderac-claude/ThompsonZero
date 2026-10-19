@@ -390,9 +390,9 @@ def test_wdl_value_head():
     x = torch.randn(4, *g.obs_shape)
     v, logits = net(x)
     assert v.shape == (4, 3)
-    sv, _ = net.postprocess(v, logits)
+    sv, _, d = net.postprocess(v, logits)
     p = torch.softmax(v, -1)
-    assert torch.allclose(sv, p[:, 0] - p[:, 2])
+    assert torch.allclose(sv, p[:, 0] - p[:, 2]) and torch.allclose(d, p[:, 1])
     z = torch.tensor([1.0, 0.0, -1.0, 0.5])
     assert torch.allclose(az.wdl_target(z), torch.tensor(
         [[1.0, 0, 0], [0, 1, 0], [0, 0, 1], [0.5, 0.5, 0]]))
@@ -403,3 +403,23 @@ def test_wdl_value_head():
     evs = [Evaluator(net, 'cpu', amp=False)] * 2
     w, d, l = az.play_match(cfg, evs, games=4, sims=16)
     assert w + d + l == 4
+
+
+def test_az_thompson_selection():
+    """az_select=thompson searches with Thompson draws from the WDL head's
+    draw probability; matches and self-play run unchanged around it."""
+    from thompsonzero import az
+    for head in ('wdl', 'scalar'):
+        cfg = preset('othello', 'az', channels=8, blocks=1, value_head=head,
+                     az_select='thompson', num_games=8, groups=2)
+        g = GameState('othello')
+        net = build(cfg, g.obs_shape, g.num_actions).eval()
+        evs = [Evaluator(net, 'cpu', amp=False)] * 2
+        w, d, l = az.play_match(cfg, evs, games=4, sims=32)
+        assert w + d + l == 4
+        eng = az.make_engine(cfg, 0, 16)
+        for _ in range(40):
+            for k in range(eng.groups):
+                obs, _ = eng.collect(k)
+                eng.apply(k, *evs[0].evaluate(obs))
+        assert eng.stats()['sims'] > 0

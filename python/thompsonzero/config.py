@@ -98,6 +98,8 @@ class Config:
     reuse_tree: bool = True
     value_head: str = 'scalar'            # scalar (tanh, MSE to z) | wdl (win/draw/loss softmax,
                                           # CE; the search reads p_win - p_loss)
+    az_select: str = 'puct'               # puct | thompson: draw from a win/draw/loss Dirichlet
+                                          # with sd = PUCT's U (src/puct.rs)
 
     # ── self-play engine ────────────────────────────────────────────────────
     num_games: int = 1024                 # concurrent games (all CPU cores share them)

@@ -388,7 +388,8 @@ impl PyAzEngine {
     #[pyo3(signature = (game, *, num_games=512, groups=2, seed=0, sims=200, wave=4,
         c_puct=1.5, fpu_reduction=0.2, virtual_loss=1.0, noise_alpha=10.0, noise_frac=0.25,
         temp_threshold=20, max_plies=None, reuse_tree=true, double_aux=1, double_min_visits=8,
-        arena_games=None, external=false, openings=None, opening_plies=2, service=false))]
+        arena_games=None, external=false, openings=None, opening_plies=2, service=false,
+        thompson=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         game: &str,
@@ -412,6 +413,7 @@ impl PyAzEngine {
         openings: Option<Vec<Vec<u16>>>,
         opening_plies: usize,
         service: bool,
+        thompson: bool,
     ) -> PyResult<Self> {
         if groups == 0 || num_games < groups {
             return Err(PyValueError::new_err("need num_games >= groups >= 1"));
@@ -435,6 +437,7 @@ impl PyAzEngine {
                 c_puct,
                 fpu_reduction,
                 virtual_loss,
+                thompson,
             },
             noise_alpha,
             noise_frac,
@@ -491,13 +494,16 @@ impl PyAzEngine {
 
     /// Feed back the evaluations for the last `collect(group)`: v float32
     /// (rows,) the mover's value in [-1, 1], logits float32 (rows,
-    /// num_actions) raw policy logits.
+    /// num_actions) raw policy logits, and optionally d float32 (rows,) the
+    /// draw probability of a win/draw/loss head (Thompson selection reads it).
+    #[pyo3(signature = (group, v, logits, d=None))]
     fn apply(
         &mut self,
         py: Python<'_>,
         group: usize,
         v: PyReadonlyArray1<f32>,
         logits: PyReadonlyArray2<f32>,
+        d: Option<PyReadonlyArray1<f32>>,
     ) -> PyResult<()> {
         if group >= self.groups() {
             return Err(PyValueError::new_err("group out of range"));
@@ -511,9 +517,16 @@ impl PyAzEngine {
                 logits.shape()
             )));
         }
+        if d.as_ref().is_some_and(|d| d.shape() != [rows]) {
+            return Err(PyValueError::new_err(format!("expected d ({rows},)")));
+        }
         let (v, logits) = (v.as_slice()?, logits.as_slice()?);
+        let d = match &d {
+            Some(d) => Some(d.as_slice()?),
+            None => None,
+        };
         let inner = &mut self.inner;
-        py.allow_threads(|| each_az!(inner, e => e.apply(group, v, logits)));
+        py.allow_threads(|| each_az!(inner, e => e.apply(group, v, d, logits)));
         Ok(())
     }
 

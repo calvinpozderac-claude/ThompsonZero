@@ -203,14 +203,16 @@ class AZNet(nn.Module):
         return (v if self.wdl else v.squeeze(1)), self.policy(t)
 
     def postprocess(self, v, logits):
-        """-> (v (B,), logits (B, A)) as fp32, for `AzEngine.apply`."""
+        """-> (v (B,), logits (B, A)) as fp32 for `AzEngine.apply`, plus the
+        draw probability d (B,) with `wdl`."""
         if self.wdl:
             p = torch.softmax(v.float(), dim=-1)
-            return p[:, 0] - p[:, 2], logits.float()
+            return p[:, 0] - p[:, 2], logits.float(), p[:, 1].contiguous()
         return v.float(), logits.float()
 
     def empty_outputs(self):
-        return (torch.zeros((0,)).numpy(), torch.zeros((0, self.num_actions)).numpy())
+        out = (torch.zeros((0,)).numpy(), torch.zeros((0, self.num_actions)).numpy())
+        return out + (torch.zeros((0,)).numpy(),) if self.wdl else out
 
 
 def build(cfg, obs_shape, num_actions):

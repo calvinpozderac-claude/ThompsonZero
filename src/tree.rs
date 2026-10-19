@@ -429,7 +429,11 @@ impl<G: Game> Tree<G> {
             };
             if let Some(t) = t {
                 let t = floor_conc(t, TARGET_CONC_FLOOR);
-                let visits = if e.acc == NONE { 0.0 } else { self.accs[e.acc as usize].n };
+                let visits = if e.acc == NONE {
+                    0.0
+                } else {
+                    self.accs[e.acc as usize].n
+                };
                 if best.is_none_or(|(b, _)| visits > b) {
                     best = Some((visits, t));
                 }
@@ -457,7 +461,11 @@ impl<G: Game> Tree<G> {
                 term: e.term,
                 prior: to64(e.prior),
                 sel: to64(e.sel),
-                acc: if e.acc == NONE { [0.0; RAW] } else { self.accs[e.acc as usize].raw() },
+                acc: if e.acc == NONE {
+                    [0.0; RAW]
+                } else {
+                    self.accs[e.acc as usize].raw()
+                },
             })
             .collect();
         Report {
@@ -563,7 +571,10 @@ mod tests {
         let mut t: Tree<Connect4> = Tree::default();
         search(&mut t, Connect4::new(), 200, &c, &mut rng);
         let tg = t.target(0, &c);
-        let (i, _) = t.visits(0).enumerate().fold((0, -1.0), |b, (i, n)| if n > b.1 { (i, n) } else { b });
+        let (i, _) = t
+            .visits(0)
+            .enumerate()
+            .fold((0, -1.0), |b, (i, n)| if n > b.1 { (i, n) } else { b });
         let a = t.edges_of(0)[i].action;
         let e = tg.edges.iter().find(|(x, _)| *x == a).unwrap().1;
         assert_eq!(tg.v, e);
@@ -577,7 +588,15 @@ mod tests {
             s.apply(a);
         }
         for rule in [
-            "mixture", "additive", "additive_mle", "avgconc", "corr", "additive_x16", "sumconc", "mean_mle", "point",
+            "mixture",
+            "additive",
+            "additive_mle",
+            "avgconc",
+            "corr",
+            "additive_x16",
+            "sumconc",
+            "mean_mle",
+            "point",
         ] {
             let c = cfg(rule);
             let mut rng = SmallRng::seed_from_u64(1);

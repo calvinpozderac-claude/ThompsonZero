@@ -6,7 +6,7 @@
 //! ```text
 //!   obs, nets = engine.collect(group)    # tree work on every core (no GIL)
 //!   ...network forward on the GPU...
-//!   engine.apply(group, v, logits)       # expand, back up, play moves
+//!   engine.apply(group, v, d, logits)    # expand, back up, play moves
 //! ```
 //!
 //! `v` is one value per row (the mover's, in [-1, 1]) and `logits` one policy
@@ -96,6 +96,7 @@ impl Default for AzConfig {
                 c_puct: 1.5,
                 fpu_reduction: 0.2,
                 virtual_loss: 1.0,
+                thompson: false,
             },
             noise_alpha: 10.0,
             noise_frac: 0.25,
@@ -267,11 +268,13 @@ impl<G: Game> AzEngine<G> {
     }
 
     /// Feed back the evaluations for the rows of the last `collect(group)`:
-    /// `v` has one value per row, `logits` NUM_ACTIONS per row.
-    pub fn apply(&mut self, group: usize, v: &[f32], logits: &[f32]) {
+    /// `v` has one value per row, `d` (if any) one draw probability per row,
+    /// `logits` NUM_ACTIONS per row.
+    pub fn apply(&mut self, group: usize, v: &[f32], d: Option<&[f32]>, logits: &[f32]) {
         let r = self.group_range(group);
         let rows: usize = self.counts[r.clone()].iter().sum();
         assert_eq!(v.len(), rows, "v has the wrong number of rows");
+        assert!(d.is_none_or(|d| d.len() == rows), "d has the wrong number of rows");
         assert_eq!(
             logits.len(),
             rows * G::NUM_ACTIONS,
@@ -284,10 +287,10 @@ impl<G: Game> AzEngine<G> {
             off += self.counts[i];
         }
         let (cfg, started) = (&self.cfg, &self.started);
-        self.slots[r.clone()]
-            .par_iter_mut()
-            .zip(offsets)
-            .for_each(|(s, off)| s.apply(cfg, started, &v[off..], &logits[off * G::NUM_ACTIONS..]));
+        self.slots[r.clone()].par_iter_mut().zip(offsets).for_each(|(s, off)| {
+            let d = d.map(|d| &d[off..]);
+            s.apply(cfg, started, &v[off..], d, &logits[off * G::NUM_ACTIONS..])
+        });
         // consumed: a repeated apply now expects (and gets) zero rows
         self.counts[r.clone()].fill(0);
         for i in r {
@@ -459,7 +462,7 @@ impl<G: Game> Slot<G> {
             self.noised = true;
         }
         for _ in 0..cfg.wave.min(self.sims.saturating_sub(self.done)) {
-            match self.tree.select(&cfg.puct, &mut self.path) {
+            match self.tree.select(&cfg.puct, &mut self.path, &mut self.rng) {
                 Selected::Terminal => {
                     self.done += 1;
                     self.stats.sims += 1;
@@ -483,19 +486,20 @@ impl<G: Game> Slot<G> {
         }
     }
 
-    fn apply(&mut self, cfg: &AzConfig, started: &AtomicUsize, v: &[f32], logits: &[f32]) {
+    fn apply(&mut self, cfg: &AzConfig, started: &AtomicUsize, v: &[f32], d: Option<&[f32]>, logits: &[f32]) {
         if !self.active {
             return;
         }
         let na = G::NUM_ACTIONS;
         for (i, q) in self.requests.drain(..).enumerate() {
             let l = &logits[i * na..(i + 1) * na];
+            let di = d.map_or(0.0, |d| d[i]);
             match q {
                 Request::Root(st) => {
-                    self.tree.add_node(st, v[i], l);
+                    self.tree.add_node(st, v[i], di, l);
                 }
                 Request::Child { edge, state } => {
-                    self.tree.expand(edge, state, v[i], l);
+                    self.tree.expand(edge, state, v[i], di, l);
                 }
             }
             self.stats.evals += 1;
@@ -661,7 +665,7 @@ mod tests {
                 let (obs, nets) = e.collect(g);
                 assert_eq!(obs.len(), nets.len() * Othello::OBS_SIZE);
                 let (v, l) = uniform::<Othello>(nets.len());
-                e.apply(g, &v, &l);
+                e.apply(g, &v, None, &l);
             }
             guard += 1;
             assert!(guard < 100_000);
@@ -688,7 +692,7 @@ mod tests {
             for g in 0..2 {
                 let (_obs, nets) = e.collect(g);
                 let (v, l) = uniform::<Connect4>(nets.len());
-                e.apply(g, &v, &l);
+                e.apply(g, &v, None, &l);
             }
         }
         assert_eq!(e.stats().games, 6);
@@ -718,7 +722,7 @@ mod tests {
         while got.is_empty() {
             let (_obs, nets) = e.collect(0);
             let (v, l) = uniform::<Othello>(nets.len());
-            e.apply(0, &v, &l);
+            e.apply(0, &v, None, &l);
             got = e.moves();
             guard += 1;
             assert!(guard < 1000);
@@ -744,7 +748,7 @@ mod tests {
                 let (_obs, nets) = e.collect(g);
                 assert!(nets.iter().all(|&n| n == 0));
                 let (v, l) = uniform::<Othello>(nets.len());
-                e.apply(g, &v, &l);
+                e.apply(g, &v, None, &l);
             }
             for (slot, st) in e.waiting() {
                 st.legal_actions(&mut legal);
