@@ -99,6 +99,8 @@ class Config:
     value_head: str = 'scalar'            # scalar (tanh, MSE to z) | wdl (win/draw/loss softmax,
                                           # CE; the search reads p_win - p_loss)
     az_select: str = 'puct'               # puct | thompson (win/draw/loss Dirichlet draws) | gaussian
+    ts_c: float = 0.0                     # Thompson draws' scale in place of c_puct (0: c_puct)
+    ts_from: float = 0.0                  # PUCT for this fraction of each search's sims, then Thompson
                                           # with sd = PUCT's U (src/puct.rs)
 
     # ── self-play engine ────────────────────────────────────────────────────

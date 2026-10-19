@@ -52,6 +52,9 @@ pub struct AzConfig {
     /// Simulations per game per `collect`.
     pub wave: usize,
     pub puct: PuctCfg,
+    /// With Thompson selection: the first `ts_from` fraction of each search's
+    /// simulations select by PUCT instead.
+    pub ts_from: f32,
     /// Self-play root noise: Dir(alpha) with alpha = min(1, noise_alpha / B)
     /// over B legal moves, mixed in with weight `noise_frac`.
     pub noise_alpha: f32,
@@ -97,7 +100,9 @@ impl Default for AzConfig {
                 fpu_reduction: 0.2,
                 virtual_loss: 1.0,
                 select: Select::Puct,
+                ts_c: 1.5,
             },
+            ts_from: 0.0,
             noise_alpha: 10.0,
             noise_frac: 0.25,
             temp_threshold: 20,
@@ -461,8 +466,13 @@ impl<G: Game> Slot<G> {
             }
             self.noised = true;
         }
+        let puct = if (self.done as f32) < cfg.ts_from * self.sims as f32 {
+            PuctCfg { select: Select::Puct, ..cfg.puct }
+        } else {
+            cfg.puct
+        };
         for _ in 0..cfg.wave.min(self.sims.saturating_sub(self.done)) {
-            match self.tree.select(&cfg.puct, &mut self.path, &mut self.rng) {
+            match self.tree.select(&puct, &mut self.path, &mut self.rng) {
                 Selected::Terminal => {
                     self.done += 1;
                     self.stats.sims += 1;

@@ -11,7 +11,9 @@ the loss
 or, with `value_head=wdl`, a win/draw/loss cross-entropy in place of the
 squared error (see `compute`).  `az_select=thompson` (win/draw/loss Dirichlet
 draws) or `az_select=gaussian` (normal draws) replaces PUCT's argmax Q + U
-with Thompson sampling (src/puct.rs); self-play is otherwise unchanged.
+with Thompson sampling (src/puct.rs), with draws scaled by `ts_c` (default
+c_puct) and, with `ts_from`, only after that fraction of each search's
+simulations has selected by PUCT; self-play is otherwise unchanged.
 
 trained with SGD + momentum 0.9 on a step schedule (OLIVAW's shape, 30x its
 LR, and 3 steps per game rather than ~6: see the `az` entry of RULES).
@@ -42,6 +44,7 @@ def make_engine(cfg, seed, sims, slots=None, **arena):
         temp_threshold=cfg.temp_threshold, max_plies=cfg.max_plies or None,
         reuse_tree=cfg.reuse_tree, double_aux=cfg.double_aux,
         double_min_visits=int(cfg.double_min_visits), select=select,
+        ts_c=cfg.ts_c or None, ts_from=cfg.ts_from,
         **kw, **arena)
 
 

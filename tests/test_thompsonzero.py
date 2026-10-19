@@ -407,12 +407,13 @@ def test_wdl_value_head():
 
 def test_az_thompson_selection():
     """az_select=thompson searches with Thompson draws from the WDL head's
-    draw probability, az_select=gaussian with normal draws; matches and
-    self-play run unchanged around them."""
+    draw probability, az_select=gaussian with normal draws (after ts_from of
+    each search by PUCT); matches and self-play run unchanged around them."""
     from thompsonzero import az
-    for head, select in [('wdl', 'thompson'), ('scalar', 'thompson'), ('scalar', 'gaussian')]:
+    for head, select, ts_from in [('wdl', 'thompson', 0.0), ('scalar', 'thompson', 0.0),
+                                  ('scalar', 'gaussian', 0.0), ('scalar', 'gaussian', 0.5)]:
         cfg = preset('othello', 'az', channels=8, blocks=1, value_head=head,
-                     az_select=select, num_games=8, groups=2)
+                     az_select=select, ts_c=0.5, ts_from=ts_from, num_games=8, groups=2)
         g = GameState('othello')
         net = build(cfg, g.obs_shape, g.num_actions).eval()
         evs = [Evaluator(net, 'cpu', amp=False)] * 2

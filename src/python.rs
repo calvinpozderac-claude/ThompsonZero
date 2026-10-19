@@ -389,7 +389,7 @@ impl PyAzEngine {
         c_puct=1.5, fpu_reduction=0.2, virtual_loss=1.0, noise_alpha=10.0, noise_frac=0.25,
         temp_threshold=20, max_plies=None, reuse_tree=true, double_aux=1, double_min_visits=8,
         arena_games=None, external=false, openings=None, opening_plies=2, service=false,
-        select="puct"))]
+        select="puct", ts_c=None, ts_from=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         game: &str,
@@ -414,6 +414,8 @@ impl PyAzEngine {
         opening_plies: usize,
         service: bool,
         select: &str,
+        ts_c: Option<f32>,
+        ts_from: f32,
     ) -> PyResult<Self> {
         if groups == 0 || num_games < groups {
             return Err(PyValueError::new_err("need num_games >= groups >= 1"));
@@ -444,7 +446,9 @@ impl PyAzEngine {
                 fpu_reduction,
                 virtual_loss,
                 select,
+                ts_c: ts_c.unwrap_or(c_puct),
             },
+            ts_from,
             noise_alpha,
             noise_frac,
             temp_threshold,

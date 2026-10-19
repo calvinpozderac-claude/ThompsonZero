@@ -18,8 +18,8 @@
 //! With Thompson selection (`Select::Dirichlet` or `Select::Gaussian`), each
 //! edge instead draws one value and descent takes the argmax.  The draw has
 //! the edge's backed-up value as its mean (the FPU value while unvisited) and
-//! PUCT's exploration term U(s,a) as its standard deviation: the bonus
-//! becomes noise of the same size.  `Dirichlet` draws p_win - p_loss from a
+//! PUCT's exploration term U(s,a) (with `ts_c` for c_puct) as its standard
+//! deviation: the bonus becomes noise of the same size.  `Dirichlet` draws p_win - p_loss from a
 //! Dirichlet over (win, draw, loss) whose draw mean is the backed-up draw
 //! probability (the node's mean while unvisited; it comes from a win/draw/loss
 //! value head, 0 without one).  `Gaussian` draws from a normal distribution.
@@ -44,6 +44,9 @@ pub struct PuctCfg {
     pub virtual_loss: f32,
     /// Edge selection rule (see the module docs).
     pub select: Select,
+    /// Thompson selection: the draws' standard deviation is U(s,a) with
+    /// this in place of `c_puct`.
+    pub ts_c: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,7 +283,7 @@ impl<G: Game> Tree<G> {
         }
         let fpu = w / visited as f32 - cfg.fpu_reduction;
         let d_node = d / visited as f32;
-        let scale = cfg.c_puct * ((1 + total) as f32).sqrt();
+        let scale = cfg.ts_c * ((1 + total) as f32).sqrt();
         let mut best = (f32::NEG_INFINITY, lo);
         for (i, e) in self.edges[lo..hi].iter().enumerate() {
             let k = e.n + e.vloss as u32;
@@ -480,6 +483,7 @@ mod tests {
         fpu_reduction: 0.2,
         virtual_loss: 1.0,
         select: Select::Puct,
+        ts_c: 1.5,
     };
     const TS: PuctCfg = PuctCfg { select: Select::Dirichlet, ..CFG };
 
