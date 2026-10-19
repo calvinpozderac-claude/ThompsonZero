@@ -15,18 +15,20 @@
 //! perspective of the node's mover; a terminal child stores its exact result
 //! on the edge and is never evaluated by the network.
 //!
-//! With `thompson`, selection instead draws one value per edge and descends
-//! the argmax.  Each edge's belief is a Dirichlet over (win, draw, loss)
-//! whose mean is the edge's backed-up value and draw probability (the FPU
-//! value and the node's mean draw probability while unvisited), and whose
-//! concentration makes the standard deviation of p_win - p_loss equal PUCT's
-//! exploration term U(s,a): the bonus becomes noise of the same size.  The
-//! draw probability comes from a win/draw/loss value head (0 without one).
+//! With Thompson selection (`Select::Dirichlet` or `Select::Gaussian`), each
+//! edge instead draws one value and descent takes the argmax.  The draw has
+//! the edge's backed-up value as its mean (the FPU value while unvisited) and
+//! PUCT's exploration term U(s,a) as its standard deviation: the bonus
+//! becomes noise of the same size.  `Dirichlet` draws p_win - p_loss from a
+//! Dirichlet over (win, draw, loss) whose draw mean is the backed-up draw
+//! probability (the node's mean while unvisited; it comes from a win/draw/loss
+//! value head, 0 without one).  `Gaussian` draws from a normal distribution.
 //!
 //! Storage is two flat arenas (nodes, edges) indexed by u32.  The root is
 //! always node 0; moving to a child rebuilds the arenas from that subtree.
 
 use rand::Rng;
+use rand_distr::{Distribution, StandardNormal};
 
 use crate::belief::gamma;
 use crate::games::Game;
@@ -40,8 +42,18 @@ pub struct PuctCfg {
     pub fpu_reduction: f32,
     /// Value an in-flight simulation is assumed to return (as a loss).
     pub virtual_loss: f32,
-    /// Thompson sampling in place of argmax Q + U (see the module docs).
-    pub thompson: bool,
+    /// Edge selection rule (see the module docs).
+    pub select: Select,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Select {
+    /// argmax Q + U
+    Puct,
+    /// argmax of a win/draw/loss Dirichlet draw per edge
+    Dirichlet,
+    /// argmax of a Gaussian draw per edge
+    Gaussian,
 }
 
 #[derive(Clone, Debug)]
@@ -198,10 +210,9 @@ impl<G: Game> Tree<G> {
         path.clear();
         let mut n = 0u32;
         loop {
-            let e = if cfg.thompson {
-                self.thompson_edge(n, cfg, rng)
-            } else {
-                self.select_edge(n, cfg)
+            let e = match cfg.select {
+                Select::Puct => self.select_edge(n, cfg),
+                _ => self.thompson_edge(n, cfg, rng),
             };
             self.edges[e].vloss += 1;
             path.push((n, e as u32));
@@ -283,7 +294,12 @@ impl<G: Game> Tree<G> {
                     ((e.w - cfg.virtual_loss * e.vloss as f32) / k as f32, e.d / k as f32)
                 };
                 let sigma = scale * e.prior / (1 + k) as f32;
-                thompson_draw(rng, q, dm, sigma)
+                if cfg.select == Select::Gaussian {
+                    let z: f32 = StandardNormal.sample(rng);
+                    q + sigma * z
+                } else {
+                    thompson_draw(rng, q, dm, sigma)
+                }
             };
             if x > best.0 {
                 best = (x, lo + i);
@@ -463,9 +479,9 @@ mod tests {
         c_puct: 1.5,
         fpu_reduction: 0.2,
         virtual_loss: 1.0,
-        thompson: false,
+        select: Select::Puct,
     };
-    const TS: PuctCfg = PuctCfg { thompson: true, ..CFG };
+    const TS: PuctCfg = PuctCfg { select: Select::Dirichlet, ..CFG };
 
     /// Plain sequential search with a uniform network (v = 0, flat logits).
     fn search<G: Game>(tree: &mut Tree<G>, state: G, sims: usize) {
@@ -582,5 +598,22 @@ mod tests {
         // non-terminal visits back up the network's draw probability
         let other = t.edges_of(0).iter().find(|e| e.action != 0 && e.n > 0).unwrap();
         assert!(other.d > 0.0 && other.d <= other.n as f32 * 0.25 + 1e-4);
+    }
+
+    #[test]
+    fn gaussian_thompson_search_finds_the_win() {
+        let mut s = Connect4::new();
+        for a in [0, 1, 0, 1, 0, 1] {
+            s.apply(a);
+        }
+        let mut t = Tree::default();
+        let cfg = PuctCfg { select: Select::Gaussian, ..CFG };
+        search_with(&mut t, s, 400, &cfg, 0.0);
+        let mut rng = SmallRng::seed_from_u64(0);
+        let e = &t.edges_of(0)[t.pick(&mut rng, false)];
+        assert_eq!(e.action, 0);
+        assert_eq!(e.w, e.n as f32);
+        assert!(e.n > 200, "the won edge takes most visits: {}", e.n);
+        assert!(t.edges.iter().all(|e| e.vloss == 0));
     }
 }

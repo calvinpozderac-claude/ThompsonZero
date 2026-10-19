@@ -16,7 +16,7 @@ use crate::az::{AzConfig, AzEngine, AzSample};
 use crate::belief::{Rule, RAW, TARGET_EPS};
 use crate::engine::{Config, Engine, Sample, Stats};
 use crate::games::{Boop, Connect4, Game, Othello};
-use crate::puct::PuctCfg;
+use crate::puct::{PuctCfg, Select};
 use crate::tree::Report;
 
 /// Run `$body` with `$g` bound to the concrete game type of `$name`.
@@ -389,7 +389,7 @@ impl PyAzEngine {
         c_puct=1.5, fpu_reduction=0.2, virtual_loss=1.0, noise_alpha=10.0, noise_frac=0.25,
         temp_threshold=20, max_plies=None, reuse_tree=true, double_aux=1, double_min_visits=8,
         arena_games=None, external=false, openings=None, opening_plies=2, service=false,
-        thompson=false))]
+        select="puct"))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         game: &str,
@@ -413,7 +413,7 @@ impl PyAzEngine {
         openings: Option<Vec<Vec<u16>>>,
         opening_plies: usize,
         service: bool,
-        thompson: bool,
+        select: &str,
     ) -> PyResult<Self> {
         if groups == 0 || num_games < groups {
             return Err(PyValueError::new_err("need num_games >= groups >= 1"));
@@ -427,6 +427,12 @@ impl PyAzEngine {
         if service && arena_games.is_some() {
             return Err(PyValueError::new_err("a search service plays no arena games"));
         }
+        let select = match select {
+            "puct" => Select::Puct,
+            "dirichlet" => Select::Dirichlet,
+            "gaussian" => Select::Gaussian,
+            _ => return Err(PyValueError::new_err(format!("unknown select {select:?}"))),
+        };
         let mut cfg = AzConfig {
             num_games,
             groups,
@@ -437,7 +443,7 @@ impl PyAzEngine {
                 c_puct,
                 fpu_reduction,
                 virtual_loss,
-                thompson,
+                select,
             },
             noise_alpha,
             noise_frac,

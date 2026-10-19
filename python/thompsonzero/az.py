@@ -9,8 +9,9 @@ the loss
     L = (z - v)^2 - pi . log p + c ||theta||^2         (c in the optimizer)
 
 or, with `value_head=wdl`, a win/draw/loss cross-entropy in place of the
-squared error (see `compute`).  `az_select=thompson` replaces PUCT's argmax
-Q + U with Thompson sampling (src/puct.rs); self-play is otherwise unchanged.
+squared error (see `compute`).  `az_select=thompson` (win/draw/loss Dirichlet
+draws) or `az_select=gaussian` (normal draws) replaces PUCT's argmax Q + U
+with Thompson sampling (src/puct.rs); self-play is otherwise unchanged.
 
 trained with SGD + momentum 0.9 on a step schedule (OLIVAW's shape, 30x its
 LR, and 3 steps per game rather than ~6: see the `az` entry of RULES).
@@ -27,7 +28,8 @@ def make_engine(cfg, seed, sims, slots=None, **arena):
     """`arena`: arena_games / external / openings / opening_plies for
     matches, or service=True for a search service with `slots` slots;
     without it, a self-play engine."""
-    if cfg.az_select not in ('puct', 'thompson'):
+    select = {'puct': 'puct', 'thompson': 'dirichlet', 'gaussian': 'gaussian'}.get(cfg.az_select)
+    if select is None:
         raise ValueError(f'unknown az_select {cfg.az_select!r}')
     kw = dict(num_games=cfg.num_games, groups=cfg.groups, wave=cfg.wave)
     if arena.get('arena_games'):
@@ -39,7 +41,7 @@ def make_engine(cfg, seed, sims, slots=None, **arena):
         virtual_loss=cfg.virtual_loss, noise_alpha=cfg.noise_alpha, noise_frac=cfg.noise_frac,
         temp_threshold=cfg.temp_threshold, max_plies=cfg.max_plies or None,
         reuse_tree=cfg.reuse_tree, double_aux=cfg.double_aux,
-        double_min_visits=int(cfg.double_min_visits), thompson=cfg.az_select == 'thompson',
+        double_min_visits=int(cfg.double_min_visits), select=select,
         **kw, **arena)
 
 

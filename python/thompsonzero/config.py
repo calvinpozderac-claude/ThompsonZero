@@ -98,7 +98,7 @@ class Config:
     reuse_tree: bool = True
     value_head: str = 'scalar'            # scalar (tanh, MSE to z) | wdl (win/draw/loss softmax,
                                           # CE; the search reads p_win - p_loss)
-    az_select: str = 'puct'               # puct | thompson: draw from a win/draw/loss Dirichlet
+    az_select: str = 'puct'               # puct | thompson (win/draw/loss Dirichlet draws) | gaussian
                                           # with sd = PUCT's U (src/puct.rs)
 
     # ── self-play engine ────────────────────────────────────────────────────

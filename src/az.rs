@@ -40,7 +40,7 @@ use rayon::prelude::*;
 
 use crate::engine::Stats;
 use crate::games::Game;
-use crate::puct::{PuctCfg, Selected, Tree, NONE};
+use crate::puct::{PuctCfg, Select, Selected, Tree, NONE};
 
 #[derive(Clone, Debug)]
 pub struct AzConfig {
@@ -96,7 +96,7 @@ impl Default for AzConfig {
                 c_puct: 1.5,
                 fpu_reduction: 0.2,
                 virtual_loss: 1.0,
-                thompson: false,
+                select: Select::Puct,
             },
             noise_alpha: 10.0,
             noise_frac: 0.25,
