@@ -24,6 +24,12 @@
 //! probability (the node's mean while unvisited; it comes from a win/draw/loss
 //! value head, 0 without one).  `Gaussian` draws from a normal distribution.
 //!
+//! With `mixmax` = l > 0, a node's value is (1 - l) times the visit-weighted
+//! mean of its children's values plus l times the best of them, recursively
+//! (a visited edge's Q is its child's backed-up value, not its running mean),
+//! and with `pick_frac` > 0 the move played after search is the highest-Q
+//! move among those with at least that fraction of the top visit count.
+//!
 //! Storage is two flat arenas (nodes, edges) indexed by u32.  The root is
 //! always node 0; moving to a child rebuilds the arenas from that subtree.
 
@@ -47,6 +53,12 @@ pub struct PuctCfg {
     /// Thompson selection: the draws' standard deviation is U(s,a) with
     /// this in place of `c_puct`.
     pub ts_c: f32,
+    /// Weight of the best child's value in a node's backed-up value (0:
+    /// the AlphaZero mean).
+    pub mixmax: f32,
+    /// Play the highest-Q move with at least this fraction of the top visit
+    /// count (0: the most visited).
+    pub pick_frac: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +96,8 @@ pub struct Node<G> {
     pub v: f32,
     /// Network draw probability (0 without a win/draw/loss head).
     pub d: f32,
+    /// Backed-up value for the mover under `mixmax` (unused at 0).
+    mu: f32,
 }
 
 pub enum Selected<G> {
@@ -140,6 +154,16 @@ impl<G: Game> Tree<G> {
         w / k as f32
     }
 
+    /// Node `n`'s backed-up value for its mover: the `mixmax` value, or
+    /// with mixmax 0 the mean.
+    pub fn backed_up_value(&self, n: u32, cfg: &PuctCfg) -> f32 {
+        if cfg.mixmax > 0.0 {
+            self.nodes[n as usize].mu
+        } else {
+            self.mean_value(n)
+        }
+    }
+
     /// Create a node for `state` from its evaluation: value `v` for the
     /// mover, draw probability `d` and policy `logits` indexed by action id.
     pub fn add_node(&mut self, state: G, v: f32, d: f32, logits: &[f32]) -> u32 {
@@ -176,6 +200,7 @@ impl<G: Game> Tree<G> {
             len: self.legal.len() as u32,
             v: v.clamp(-1.0, 1.0),
             d: d.clamp(0.0, 1.0),
+            mu: v.clamp(-1.0, 1.0),
         });
         (self.nodes.len() - 1) as u32
     }
@@ -252,13 +277,16 @@ impl<G: Game> Tree<G> {
             w += e.w;
             visited += e.n;
         }
-        let fpu = w / visited as f32 - cfg.fpu_reduction;
+        let mixmax = cfg.mixmax > 0.0;
+        let fpu = if mixmax { nd.mu } else { w / visited as f32 } - cfg.fpu_reduction;
         let scale = cfg.c_puct * ((1 + total) as f32).sqrt();
         let mut best = (f32::NEG_INFINITY, lo);
         for (i, e) in self.edges[lo..hi].iter().enumerate() {
             let k = e.n + e.vloss as u32;
             let q = if k == 0 {
                 fpu
+            } else if mixmax && e.n > 0 {
+                (self.edge_q(nd.player, e) * e.n as f32 - cfg.virtual_loss * e.vloss as f32) / k as f32
             } else {
                 (e.w - cfg.virtual_loss * e.vloss as f32) / k as f32
             };
@@ -314,7 +342,7 @@ impl<G: Game> Tree<G> {
     /// Fold value `v` and draw probability `d` (from `persp`'s point of view)
     /// into every edge on the path, `v` negated for nodes whose mover is the
     /// other player.
-    pub fn backup(&mut self, path: &[(u32, u32)], v: f32, d: f32, persp: u8, _cfg: &PuctCfg) {
+    pub fn backup(&mut self, path: &[(u32, u32)], v: f32, d: f32, persp: u8, cfg: &PuctCfg) {
         for &(n, e) in path.iter().rev() {
             let x = if self.nodes[n as usize].player == persp { v } else { -v };
             let edge = &mut self.edges[e as usize];
@@ -322,7 +350,42 @@ impl<G: Game> Tree<G> {
             edge.n += 1;
             edge.w += x;
             edge.d += d;
+            if cfg.mixmax > 0.0 {
+                self.refresh(n, cfg.mixmax);
+            }
         }
+    }
+
+    /// Visited edge `e` of a node whose mover is `player`, as seen by that
+    /// mover under `mixmax`: the exact result, else the child's backed-up value.
+    fn edge_q(&self, player: u8, e: &Edge) -> f32 {
+        if !e.term.is_nan() {
+            return e.term;
+        }
+        if e.child == NONE {
+            return e.w / e.n as f32;
+        }
+        let c = &self.nodes[e.child as usize];
+        if c.player == player {
+            c.mu
+        } else {
+            -c.mu
+        }
+    }
+
+    /// Recompute node `n`'s mixmax value from its (current) children.
+    fn refresh(&mut self, n: u32, l: f32) {
+        let nd = &self.nodes[n as usize];
+        let (mut w, mut k, mut mx) = (nd.v, 1u32, f32::NEG_INFINITY);
+        for e in self.edges_of(n).iter().filter(|e| e.n > 0) {
+            let q = self.edge_q(nd.player, e);
+            w += e.n as f32 * q;
+            k += e.n;
+            mx = mx.max(q);
+        }
+        let mean = w / k as f32;
+        let mu = if mx.is_finite() { (1.0 - l) * mean + l * mx } else { mean };
+        self.nodes[n as usize].mu = mu.clamp(-1.0, 1.0);
     }
 
     /// Back up the freshly expanded child at the end of `path`.
@@ -335,8 +398,9 @@ impl<G: Game> Tree<G> {
 
     /// Index (into `edges_of(0)`) of the move to play: sampled in proportion
     /// to visits if `sample`, else the most visited (ties: higher Q, then
-    /// prior).  With no visits at all, the prior decides.
-    pub fn pick<R: Rng>(&self, rng: &mut R, sample: bool) -> usize {
+    /// prior), or with `pick_frac` the highest Q among the well visited.
+    /// With no visits at all, the prior decides.
+    pub fn pick<R: Rng>(&self, rng: &mut R, sample: bool, cfg: &PuctCfg) -> usize {
         let edges = self.edges_of(0);
         let total: u32 = edges.iter().map(|e| e.n).sum();
         if total == 0 {
@@ -361,7 +425,17 @@ impl<G: Game> Tree<G> {
                 u -= e.n;
             }
         }
-        let q = |e: &Edge| if e.n > 0 { e.w / e.n as f32 } else { -2.0 };
+        let player = self.nodes[0].player;
+        let q = |e: &Edge| match e.n {
+            0 => -2.0,
+            _ if cfg.mixmax > 0.0 => self.edge_q(player, e),
+            n => e.w / n as f32,
+        };
+        if cfg.pick_frac > 0.0 {
+            let maxn = edges.iter().map(|e| e.n).max().unwrap_or(0);
+            let floor = (cfg.pick_frac * maxn as f32).max(1.0);
+            return argmax(edges.iter().map(|e| if e.n as f32 >= floor { q(e) } else { -3.0 }));
+        }
         let mut best = 0;
         for (i, e) in edges.iter().enumerate() {
             let b = &edges[best];
@@ -484,6 +558,8 @@ mod tests {
         virtual_loss: 1.0,
         select: Select::Puct,
         ts_c: 1.5,
+        mixmax: 0.0,
+        pick_frac: 0.0,
     };
     const TS: PuctCfg = PuctCfg { select: Select::Dirichlet, ..CFG };
 
@@ -532,7 +608,7 @@ mod tests {
         let mut t = Tree::default();
         search(&mut t, s, 400);
         let mut rng = SmallRng::seed_from_u64(0);
-        let i = t.pick(&mut rng, false);
+        let i = t.pick(&mut rng, false, &CFG);
         let e = &t.edges_of(0)[i];
         assert_eq!(e.action, 0);
         assert_eq!(e.w, e.n as f32, "every visit of a won edge returns +1");
@@ -552,7 +628,7 @@ mod tests {
             }
         }
         let mut rng = SmallRng::seed_from_u64(1);
-        let i = t.pick(&mut rng, false);
+        let i = t.pick(&mut rng, false, &CFG);
         let below = t.visits(t.edges_of(0)[i].child);
         t.advance(i);
         assert_eq!(t.visits(0), below);
@@ -594,7 +670,7 @@ mod tests {
         let mut t = Tree::default();
         search_with(&mut t, s, 400, &TS, 0.25);
         let mut rng = SmallRng::seed_from_u64(0);
-        let e = &t.edges_of(0)[t.pick(&mut rng, false)];
+        let e = &t.edges_of(0)[t.pick(&mut rng, false, &CFG)];
         assert_eq!(e.action, 0);
         assert_eq!(e.w, e.n as f32);
         assert_eq!(e.d, 0.0, "a won edge backs up no draw mass");
@@ -614,7 +690,7 @@ mod tests {
         let cfg = PuctCfg { select: Select::Gaussian, ..CFG };
         search_with(&mut t, s, 400, &cfg, 0.0);
         let mut rng = SmallRng::seed_from_u64(0);
-        let e = &t.edges_of(0)[t.pick(&mut rng, false)];
+        let e = &t.edges_of(0)[t.pick(&mut rng, false, &CFG)];
         assert_eq!(e.action, 0);
         assert_eq!(e.w, e.n as f32);
         assert!(e.n > 200, "the won edge takes most visits: {}", e.n);

@@ -425,3 +425,22 @@ def test_az_thompson_selection():
                 obs, _ = eng.collect(k)
                 eng.apply(k, *evs[0].evaluate(obs))
         assert eng.stats()['sims'] > 0
+
+
+def test_az_mixmax_and_q_pick():
+    """mixmax / pick_frac change the backup and the move played; matches and
+    self-play run unchanged around them."""
+    from thompsonzero import az
+    cfg = preset('othello', 'az', channels=8, blocks=1, mixmax=0.25, pick_frac=0.2,
+                 num_games=8, groups=2, temp_threshold=2)
+    g = GameState('othello')
+    net = build(cfg, g.obs_shape, g.num_actions).eval()
+    evs = [Evaluator(net, 'cpu', amp=False)] * 2
+    w, d, l = az.play_match(cfg, evs, games=4, sims=32)
+    assert w + d + l == 4
+    eng = az.make_engine(cfg, 0, 16)
+    for _ in range(40):
+        for k in range(eng.groups):
+            obs, _ = eng.collect(k)
+            eng.apply(k, *evs[0].evaluate(obs))
+    assert eng.stats()['sims'] > 0

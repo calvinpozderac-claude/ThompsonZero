@@ -5,7 +5,7 @@
 
 use numpy::ndarray::{Array1, Array2, Array3, Array4};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
     PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyValueError;
@@ -16,6 +16,7 @@ use crate::az::{AzConfig, AzEngine, AzSample};
 use crate::belief::{Rule, RAW, TARGET_EPS};
 use crate::engine::{Config, Engine, Sample, Stats};
 use crate::games::{Boop, Connect4, Game, Othello};
+use crate::lab::{self, LabCfg, LabEngine};
 use crate::puct::{PuctCfg, Select};
 use crate::tree::Report;
 
@@ -64,6 +65,22 @@ enum AnyAz {
     Boop(AzEngine<Boop>),
 }
 
+enum AnyLab {
+    C4(LabEngine<Connect4>),
+    Othello(LabEngine<Othello>),
+    Boop(LabEngine<Boop>),
+}
+
+macro_rules! each_lab {
+    ($any:expr, $e:ident => $body:expr) => {
+        match $any {
+            AnyLab::C4($e) => $body,
+            AnyLab::Othello($e) => $body,
+            AnyLab::Boop($e) => $body,
+        }
+    };
+}
+
 macro_rules! each_az {
     ($any:expr, $e:ident => $body:expr) => {
         match $any {
@@ -77,6 +94,7 @@ macro_rules! each_az {
 trait Wrap: Game + Sized {
     fn wrap(e: Engine<Self>) -> AnyEngine;
     fn wrap_az(e: AzEngine<Self>) -> AnyAz;
+    fn wrap_lab(e: LabEngine<Self>) -> AnyLab;
     fn wrap_state(s: Self) -> AnyState;
     fn unwrap_state(s: &AnyState) -> Option<Self>;
 }
@@ -86,6 +104,9 @@ impl Wrap for Connect4 {
     }
     fn wrap_az(e: AzEngine<Self>) -> AnyAz {
         AnyAz::C4(e)
+    }
+    fn wrap_lab(e: LabEngine<Self>) -> AnyLab {
+        AnyLab::C4(e)
     }
     fn wrap_state(s: Self) -> AnyState {
         AnyState::C4(s)
@@ -104,6 +125,9 @@ impl Wrap for Othello {
     fn wrap_az(e: AzEngine<Self>) -> AnyAz {
         AnyAz::Othello(e)
     }
+    fn wrap_lab(e: LabEngine<Self>) -> AnyLab {
+        AnyLab::Othello(e)
+    }
     fn wrap_state(s: Self) -> AnyState {
         AnyState::Othello(s)
     }
@@ -120,6 +144,9 @@ impl Wrap for Boop {
     }
     fn wrap_az(e: AzEngine<Self>) -> AnyAz {
         AnyAz::Boop(e)
+    }
+    fn wrap_lab(e: LabEngine<Self>) -> AnyLab {
+        AnyLab::Boop(e)
     }
     fn wrap_state(s: Self) -> AnyState {
         AnyState::Boop(s)
@@ -389,7 +416,7 @@ impl PyAzEngine {
         c_puct=1.5, fpu_reduction=0.2, virtual_loss=1.0, noise_alpha=10.0, noise_frac=0.25,
         temp_threshold=20, max_plies=None, reuse_tree=true, double_aux=1, double_min_visits=8,
         arena_games=None, external=false, openings=None, opening_plies=2, service=false,
-        select="puct", ts_c=None, ts_from=0.0))]
+        select="puct", ts_c=None, ts_from=0.0, mixmax=0.0, pick_frac=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         game: &str,
@@ -416,6 +443,8 @@ impl PyAzEngine {
         select: &str,
         ts_c: Option<f32>,
         ts_from: f32,
+        mixmax: f32,
+        pick_frac: f32,
     ) -> PyResult<Self> {
         if groups == 0 || num_games < groups {
             return Err(PyValueError::new_err("need num_games >= groups >= 1"));
@@ -447,6 +476,8 @@ impl PyAzEngine {
                 virtual_loss,
                 select,
                 ts_c: ts_c.unwrap_or(c_puct),
+                mixmax,
+                pick_frac,
             },
             ts_from,
             noise_alpha,
@@ -847,10 +878,215 @@ fn name_of<G: Game>(_: &G) -> &'static str {
     G::NAME
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Search lab
+// ════════════════════════════════════════════════════════════════════════════
+
+fn search_in_lab<G: Wrap>(e: &mut LabEngine<G>, slot: usize, s: &AnyState) -> PyResult<()> {
+    e.search(slot, state_for(s)?).map_err(PyValueError::new_err)
+}
+
+/// `LabCfg` from keyword options (see `src/lab.rs`); unknown keys or values
+/// are errors.
+fn lab_cfg(opts: Option<&Bound<'_, PyDict>>) -> PyResult<LabCfg> {
+    let mut c = LabCfg::default();
+    let Some(opts) = opts else { return Ok(c) };
+    fn pick<T: Copy>(v: &str, key: &str, table: &[(&str, T)]) -> PyResult<T> {
+        table
+            .iter()
+            .find(|(k, _)| *k == v)
+            .map(|x| x.1)
+            .ok_or_else(|| PyValueError::new_err(format!("bad {key} {v:?}")))
+    }
+    for (k, v) in opts.iter() {
+        let key: String = k.extract()?;
+        let f = || -> PyResult<f32> { v.extract::<f32>() };
+        let st = || -> PyResult<String> { v.extract::<String>() };
+        match key.as_str() {
+            "sel" => {
+                c.sel = pick(&st()?, &key, &[("puct", lab::Sel::Puct), ("ts", lab::Sel::Ts), ("gumbel", lab::Sel::Gumbel)])?
+            }
+            "sigma" => {
+                c.sigma = pick(
+                    &st()?,
+                    &key,
+                    &[
+                        ("u", lab::Sigma::U),
+                        ("count", lab::Sigma::Count),
+                        ("netvar", lab::Sigma::NetVar),
+                        ("emp", lab::Sigma::Emp),
+                        ("bayes", lab::Sigma::Bayes),
+                        ("fit", lab::Sigma::Fit),
+                    ],
+                )?
+            }
+            "z" => {
+                c.zmode = pick(
+                    &st()?,
+                    &key,
+                    &[
+                        ("normal", lab::ZMode::Normal),
+                        ("abs", lab::ZMode::Abs),
+                        ("pos", lab::ZMode::Pos),
+                        ("one", lab::ZMode::One),
+                    ],
+                )?
+            }
+            "backup" => {
+                c.backup = pick(
+                    &st()?,
+                    &key,
+                    &[
+                        ("mean", lab::Backup::Mean),
+                        ("power", lab::Backup::Power),
+                        ("mixmax", lab::Backup::MixMax),
+                        ("softmax", lab::Backup::SoftMax),
+                        ("bayes", lab::Backup::Bayes),
+                    ],
+                )?
+            }
+            "pick" => {
+                c.pick = pick(
+                    &st()?,
+                    &key,
+                    &[("visits", lab::Pick::Visits), ("q", lab::Pick::Q), ("improved", lab::Pick::Improved)],
+                )?
+            }
+            "depths" => {
+                c.depths = pick(
+                    &st()?,
+                    &key,
+                    &[("all", lab::Depths::All), ("root", lab::Depths::Root), ("interior", lab::Depths::Interior)],
+                )?
+            }
+            "c_puct" => c.c_puct = f()?,
+            "fpu" => c.fpu = f()?,
+            "virtual_loss" => c.virtual_loss = f()?,
+            "kappa" => c.kappa = f()?,
+            "ts_c" => c.ts_c = f()?,
+            "pexp" => c.pexp = f()?,
+            "nexp" => c.nexp = f()?,
+            "n0" => c.n0 = f()?,
+            "fit_a" => c.fit[0] = f()?,
+            "fit_b" => c.fit[1] = f()?,
+            "fit_c" => c.fit[2] = f()?,
+            "ts_from" => c.ts_from = f()?,
+            "bparam" => c.bparam = f()?,
+            "leaf_s" => c.leaf_s = f()?,
+            "c_visit" => c.c_visit = f()?,
+            "c_scale" => c.c_scale = f()?,
+            "pick_frac" => c.pick_frac = f()?,
+            "eager" => c.eager = v.extract::<i32>()?,
+            "eager_min" => c.eager_min = v.extract::<u32>()?,
+            "report" => c.report = v.extract::<bool>()?,
+            _ => return Err(PyValueError::new_err(format!("unknown lab option {key:?}"))),
+        }
+    }
+    Ok(c)
+}
+
+/// Offline search lab as a search service (see `src/lab.rs`): `search(slot,
+/// state)`, then collect/apply waves until `moves()` returns the move.
+#[pyclass(name = "LabEngine", module = "thompsonzero._core")]
+pub struct PyLabEngine {
+    inner: AnyLab,
+    #[pyo3(get)]
+    num_actions: usize,
+    obs_shape: (usize, usize, usize),
+}
+
+#[pymethods]
+impl PyLabEngine {
+    #[new]
+    #[pyo3(signature = (game, *, slots, sims, wave=4, seed=0, **opts))]
+    fn new(game: &str, slots: usize, sims: usize, wave: usize, seed: u64, opts: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let cfg = lab_cfg(opts)?;
+        if wave == 0 || slots == 0 {
+            return Err(PyValueError::new_err("need wave >= 1 and slots >= 1"));
+        }
+        with_game!(game, G => Ok(PyLabEngine {
+            inner: G::wrap_lab(LabEngine::<G>::new(cfg, slots, sims, wave, seed)),
+            num_actions: G::NUM_ACTIONS,
+            obs_shape: obs_shape::<G>(),
+        }))
+    }
+
+    fn search(&mut self, slot: usize, state: &PyGameState) -> PyResult<()> {
+        each_lab!(&mut self.inner, e => search_in_lab(e, slot, &state.inner))
+    }
+
+    /// Simulate every active search up to its next evaluations; the group
+    /// argument is accepted for AzEngine compatibility.
+    #[pyo3(signature = (group=0))]
+    fn collect<'py>(&mut self, py: Python<'py>, group: usize) -> PyResult<Batch<'py>> {
+        let _ = group;
+        let inner = &mut self.inner;
+        let obs = py.allow_threads(|| each_lab!(inner, e => e.collect()));
+        let (c, h, w) = self.obs_shape;
+        let rows = obs.len() / (c * h * w);
+        let obs = Array4::from_shape_vec((rows, c, h, w), obs).unwrap();
+        Ok((obs.into_pyarray(py), Array1::<u8>::zeros(rows).into_pyarray(py)))
+    }
+
+    #[pyo3(signature = (group, v, logits, d=None))]
+    fn apply(
+        &mut self,
+        py: Python<'_>,
+        group: usize,
+        v: PyReadonlyArray1<f32>,
+        logits: PyReadonlyArray2<f32>,
+        d: Option<PyReadonlyArray1<f32>>,
+    ) -> PyResult<()> {
+        let _ = group;
+        let rows = each_lab!(&self.inner, e => e.pending_rows());
+        if v.shape() != [rows] || logits.shape() != [rows, self.num_actions] {
+            return Err(PyValueError::new_err(format!("expected {rows} rows")));
+        }
+        if d.as_ref().is_some_and(|d| d.shape() != [rows]) {
+            return Err(PyValueError::new_err(format!("expected d ({rows},)")));
+        }
+        let (v, logits) = (v.as_slice()?, logits.as_slice()?);
+        let d = match &d {
+            Some(d) => Some(d.as_slice()?),
+            None => None,
+        };
+        let inner = &mut self.inner;
+        py.allow_threads(|| each_lab!(inner, e => e.apply(v, d, logits)));
+        Ok(())
+    }
+
+    fn moves(&mut self) -> Vec<(usize, u16)> {
+        each_lab!(&mut self.inner, e => e.moves())
+    }
+
+    /// Finished searches' root reports: [(slot, rows (edges, 11) float32,
+    /// [v, var, mu, N])] (columns in `Tree::report`).
+    fn reports<'py>(&mut self, py: Python<'py>) -> Vec<(usize, Bound<'py, PyArray2<f32>>, [f32; 4])> {
+        each_lab!(&mut self.inner, e => e.reports())
+            .into_iter()
+            .map(|r| {
+                let n = r.rows.len() / lab::REPORT_COLS;
+                let a = Array2::from_shape_vec((n, lab::REPORT_COLS), r.rows).unwrap();
+                (r.slot, a.into_pyarray(py), r.root)
+            })
+            .collect()
+    }
+
+    /// Network evaluations so far.
+    fn evals(&self) -> u64 {
+        each_lab!(&self.inner, e => e.evals())
+    }
+
+    fn set_sims(&mut self, sims: usize) {
+        each_lab!(&mut self.inner, e => e.sims = sims)
+    }
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEngine>()?;
     m.add_class::<PyAzEngine>()?;
+    m.add_class::<PyLabEngine>()?;
     m.add_class::<PyGameState>()?;
     Ok(())
 }

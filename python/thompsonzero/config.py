@@ -101,6 +101,8 @@ class Config:
     az_select: str = 'puct'               # puct | thompson (win/draw/loss Dirichlet draws) | gaussian
     ts_c: float = 0.0                     # Thompson draws' scale in place of c_puct (0: c_puct)
     ts_from: float = 0.0                  # PUCT for this fraction of each search's sims, then Thompson
+    mixmax: float = 0.0                   # node value = (1 - l) mean + l best child (0: AlphaZero's mean)
+    pick_frac: float = 0.0                # play the best-Q move with >= this fraction of top visits (0: most visited)
                                           # with sd = PUCT's U (src/puct.rs)
 
     # ── self-play engine ────────────────────────────────────────────────────

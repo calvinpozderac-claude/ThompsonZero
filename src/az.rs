@@ -101,6 +101,8 @@ impl Default for AzConfig {
                 virtual_loss: 1.0,
                 select: Select::Puct,
                 ts_c: 1.5,
+                mixmax: 0.0,
+                pick_frac: 0.0,
             },
             ts_from: 0.0,
             noise_alpha: 10.0,
@@ -525,7 +527,7 @@ impl<G: Game> Slot<G> {
             return;
         }
         if cfg.service {
-            let idx = self.tree.pick(&mut self.rng, false);
+            let idx = self.tree.pick(&mut self.rng, false, &cfg.puct);
             self.moved = Some(self.tree.edges_of(0)[idx].action);
             self.tree.clear();
             self.active = false;
@@ -549,7 +551,7 @@ impl<G: Game> Slot<G> {
     fn play_move(&mut self, cfg: &AzConfig) {
         let selfplay = cfg.selfplay();
         let forced = self.tree.edges_of(0).len() == 1;
-        let idx = self.tree.pick(&mut self.rng, selfplay && self.ply < cfg.temp_threshold);
+        let idx = self.tree.pick(&mut self.rng, selfplay && self.ply < cfg.temp_threshold, &cfg.puct);
         let action = self.tree.edges_of(0)[idx].action;
         if selfplay && !forced {
             let mut obs = vec![0f32; G::OBS_SIZE];

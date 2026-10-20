@@ -54,7 +54,10 @@ def eval_search_rule(cfg):
 
 def search_engine(cfg, slots, sims, seed=0):
     """`cfg`'s search (TZ or AZ, as at evaluation time) as a search service
-    with `slots` slots: `search(slot, state)`, collect/apply, `moves()`."""
+    with `slots` slots: `search(slot, state)`, collect/apply, `moves()`.  A
+    `lab.LabSide` makes its own."""
+    if hasattr(cfg, 'make_engine'):
+        return cfg.make_engine(slots, sims, seed)
     if cfg.algo == 'az':
         return az.make_engine(cfg, seed, sims, slots=slots, service=True)
     return _core.Engine(
