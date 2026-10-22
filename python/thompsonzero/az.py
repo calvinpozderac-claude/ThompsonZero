@@ -49,6 +49,8 @@ def make_engine(cfg, seed, sims, slots=None, **arena):
         reuse_tree=cfg.reuse_tree, double_aux=cfg.double_aux,
         double_min_visits=int(cfg.double_min_visits), select=select,
         ts_c=cfg.ts_c or None, ts_from=cfg.ts_from, mixmax=cfg.mixmax, pick_frac=cfg.pick_frac,
+        aux_depth=cfg.aux_depth, aux_pow=cfg.aux_pow, q_lambda=cfg.q_lambda,
+        q_min_visits=cfg.q_min_visits, stv_lambda=cfg.stv_lambda,
         **kw, **arena)
 
 
@@ -58,13 +60,25 @@ def wdl_target(z):
     return torch.stack([z.clamp_min(0), 1 - z.abs(), (-z).clamp_min(0)], -1)
 
 
-def compute(v, logits, b, value_weight=1.0):
+def _wmean(x, w):
+    return (w * x).sum() / w.sum().clamp_min(1e-6)
+
+
+def compute(v, logits, b, value_weight=1.0, extra=None, cfg=None):
     """Mean (z - v)^2 over valued rows -- or with (B, 3) win/draw/loss
     logits, their cross-entropy to `wdl_target(z)` -- plus the policy
-    cross-entropy over rows with a search target.  Returns (total, dict of
-    detached scalars)."""
+    cross-entropy over rows with a search target, plus any auxiliary heads'
+    losses (`extra`, weighted by cfg.<name>_head).  With cfg.q_blend = a,
+    played positions' value target is (1 - a) z + a q.  Returns (total,
+    dict of detached scalars)."""
+    main = b.get('main')
     zw = b['z_w']
     z = b['z'].float()
+    if cfg is not None and main is not None:
+        if cfg.q_blend:
+            z = torch.where(main > 0, (1 - cfg.q_blend) * z + cfg.q_blend * b['q'], z)
+        if not cfg.aux_to_main:
+            zw = zw * main
     if v.dim() == 2:
         logq = torch.log_softmax(v.float(), dim=-1)
         err = -(wdl_target(z) * logq).sum(-1)
@@ -73,17 +87,38 @@ def compute(v, logits, b, value_weight=1.0):
         err = (v.float() - z) ** 2
     mse = (zw * err).sum() / zw.sum().clamp_min(1.0)
     pi = b['pi']
-    has_pi = (pi.sum(-1) > 0).float()
+    has_pi = (pi.sum(-1) > 0).float() * b.get('pi_w', 1.0)
     logp = torch.log_softmax(logits.float(), dim=-1)
     ce = -(pi * logp).sum(-1)
     policy = (has_pi * ce).sum() / has_pi.sum().clamp_min(1.0)
     total = value_weight * mse + policy
+    parts = {}
+    for name, y in (extra or {}).items():
+        y = y.float()
+        if name == 'q':
+            # every sample's own search value: played ones fully, doubled ones by weight
+            l = _wmean((y - b['q']) ** 2, torch.where(main > 0, torch.ones_like(zw), b['z_w']))
+        elif name == 'stv':
+            l = _wmean((y - b['stv']) ** 2, b['stv_w'])
+        elif name == 'var':
+            l = _wmean((y - (b['z'].float() - v.detach().float()) ** 2) ** 2, b['z_w'] * main)
+        elif name == 'own':
+            l = _wmean(((y - b['own']) ** 2).mean(-1), b['own_w'])
+        elif name == 'score':
+            l = _wmean((y - b['own'].mean(-1)) ** 2, b['own_w'])
+        elif name == 'reply':
+            l = _wmean(-(b['reply'] * torch.log_softmax(y, dim=-1)).sum(-1), b['reply_w'])
+        else:
+            raise ValueError(f'unknown auxiliary head {name!r}')
+        w = getattr(cfg, f'{"own" if name == "score" else name}_head')
+        total = total + w * l
+        parts[f'aux_{name}'] = l.detach()
     with torch.no_grad():
         # target entropy: the irreducible part of `policy`
         ent = -(pi * torch.log(pi.clamp_min(1e-12))).sum(-1)
-        parts = {'loss': total.detach(), 'value': mse.detach(), 'policy': policy.detach(),
-                 'pi_entropy': (has_pi * ent).sum() / has_pi.sum().clamp_min(1.0),
-                 'v_mean_abs': v.float().abs().mean()}
+        parts.update({'loss': total.detach(), 'value': mse.detach(), 'policy': policy.detach(),
+                      'pi_entropy': (has_pi * ent).sum() / has_pi.sum().clamp_min(1.0),
+                      'v_mean_abs': v.float().abs().mean()})
     return total, parts
 
 

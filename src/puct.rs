@@ -164,6 +164,33 @@ impl<G: Game> Tree<G> {
         }
     }
 
+    /// Every node's max-weighted value for its mover: (1 - l) times its
+    /// mean value plus l times the best of its children with at least
+    /// `min_visits` visits (exact results, else their own value), so l = 1
+    /// is minimax over the well-visited tree with mean values at its
+    /// frontier.  Children are always stored after their parents.
+    pub fn mix_values(&self, l: f32, min_visits: u32) -> Vec<f32> {
+        let mut out = vec![0.0; self.nodes.len()];
+        for n in (0..self.nodes.len()).rev() {
+            let nd = &self.nodes[n];
+            let mean = self.mean_value(n as u32);
+            let mut mx = f32::NEG_INFINITY;
+            for e in self.edges_of(n as u32).iter().filter(|e| e.n >= min_visits.max(1)) {
+                let q = if !e.term.is_nan() {
+                    e.term
+                } else if e.child == NONE {
+                    continue;
+                } else {
+                    let c = e.child as usize;
+                    if self.nodes[c].player == nd.player { out[c] } else { -out[c] }
+                };
+                mx = mx.max(q);
+            }
+            out[n] = if mx.is_finite() { (1.0 - l) * mean + l * mx } else { mean };
+        }
+        out
+    }
+
     /// Create a node for `state` from its evaluation: value `v` for the
     /// mover, draw probability `d` and policy `logits` indexed by action id.
     pub fn add_node(&mut self, state: G, v: f32, d: f32, logits: &[f32]) -> u32 {
@@ -613,6 +640,25 @@ mod tests {
         assert_eq!(e.action, 0);
         assert_eq!(e.w, e.n as f32, "every visit of a won edge returns +1");
         assert!(t.mean_value(0) > 0.5);
+    }
+
+    #[test]
+    fn mix_values_interpolate_mean_and_minimax() {
+        let mut t: Tree<Othello> = Tree::default();
+        search(&mut t, Othello::new(), 300);
+        let mean = t.mix_values(0.0, 1);
+        for n in 0..t.nodes.len() as u32 {
+            assert!((mean[n as usize] - t.mean_value(n)).abs() < 1e-5);
+        }
+        let mm = t.mix_values(1.0, 1);
+        // the root's minimax value is its best child's, from the root's side
+        let best = t
+            .edges_of(0)
+            .iter()
+            .filter(|e| e.n > 0)
+            .map(|e| -mm[e.child as usize])
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!((mm[0] - best).abs() < 1e-6);
     }
 
     #[test]

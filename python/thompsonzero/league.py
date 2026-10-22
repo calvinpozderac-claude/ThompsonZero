@@ -46,7 +46,8 @@ def finished(run_dir):
     if not os.path.exists(os.path.join(run_dir, 'config.json')):
         return False
     with open(os.path.join(run_dir, 'config.json')) as f:
-        episodes = json.load(f)['episodes']
+        c = json.load(f)
+        episodes = c.get('stop_at') or c['episodes']
     labels = [int(f[6:-3]) for f in os.listdir(run_dir) if f.startswith('bench_') and f.endswith('.pt')]
     return max(labels, default=0) >= episodes
 

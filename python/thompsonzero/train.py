@@ -31,7 +31,7 @@ from .arena import play_match
 from .config import Config
 from .inference import Evaluator, SelfPlay
 from .network import build
-from .replay import AZ_SCHEMA, TZ_SCHEMA, ReplayBuffer
+from .replay import TZ_SCHEMA, ReplayBuffer, az_schema
 
 
 def pick_device(pref='auto'):
@@ -55,7 +55,11 @@ def make_engine(cfg, seed, sims):
 
 
 def make_buffer(cfg, obs_shape, num_actions, device):
-    schema = AZ_SCHEMA if cfg.algo == 'az' else TZ_SCHEMA
+    if cfg.algo == 'az':
+        schema = az_schema(reply=cfg.reply_head > 0, own=cfg.own_head > 0,
+                           squares=obs_shape[1] * obs_shape[2])
+    else:
+        schema = TZ_SCHEMA
     return ReplayBuffer(cfg.buffer_size, obs_shape, num_actions, device, schema)
 
 
@@ -78,8 +82,8 @@ def make_step(net, opt, cfg, device, buffer):
     if cfg.algo == 'az':
         def forward_loss(b):
             with torch.autocast('cuda', torch.bfloat16, enabled=amp):
-                v, logits = net(b['obs'])
-            return az.compute(v, logits, b, cfg.value_weight)
+                v, logits, extra = net(b['obs'], aux=True)
+            return az.compute(v, logits, b, cfg.value_weight, extra, cfg)
     else:
         weights = {k: float(w) for k, w in cfg.loss_weights.items() if w}
         unknown = set(weights) - {'klv', 'kla', 'cev', 'cea', 'cons'}
@@ -246,8 +250,9 @@ def train(cfg: Config):
     gap = defaultdict(list)
     owed = 0.0
     window = dict(t=time.time(), episode=episode, steps=steps, stats=None)
+    added_rows = added_main = 0
     try:
-        while episode < cfg.episodes:
+        while episode < (cfg.stop_at or cfg.episodes):
             if selfplay.error is not None:
                 raise RuntimeError('self-play thread failed') from selfplay.error
             try:
@@ -255,6 +260,8 @@ def train(cfg: Config):
             except queue.Empty:
                 continue
             rows = buffer.add(samples)
+            added_rows += len(rows)
+            added_main += float(samples['main'].sum()) if 'main' in samples else len(rows)
             prev, episode = episode, episode + games
             if cfg.fresh_eval_every and episode // cfg.fresh_eval_every > prev // cfg.fresh_eval_every:
                 # generalisation gap: loss on games not yet trained on vs on
@@ -273,7 +280,10 @@ def train(cfg: Config):
                 owed = 0.0
             net.train()
             while owed >= 1.0:
-                parts = step(buffer.sample(cfg.batch_size, gen, cfg.window_at(episode)))
+                win = cfg.window_at(episode)
+                if win and cfg.window_main and added_main:
+                    win = int(win * added_rows / added_main)
+                parts = step(buffer.sample(cfg.batch_size, gen, win))
                 for k, v in parts.items():
                     acc[k] += v           # stays on device until logged
                 n_acc += 1
@@ -323,6 +333,9 @@ def _log(run, cfg, episode, steps, buffer, acc, n_acc, gap, selfplay, window, op
         terms = (f'loss {m.get("loss", float("nan")):.3f} (value {m.get("value", 0):.3f} '
                  f'policy {m.get("policy", 0):.3f} | pi entropy {m.get("pi_entropy", 0):.3f}) '
                  f'| |v| {m.get("v_mean_abs", 0):.2f} doubles {d.get("double_aux", 0) / games:.0f}/game')
+        extra = ' '.join(f'{k[4:]} {x:.3f}' for k, x in m.items() if k.startswith('aux_'))
+        if extra:
+            terms += f' | aux {extra}'
     else:
         w = cfg.loss_weights
         terms = ' '.join(f'{k} {m.get(k, float("nan")):.3f}' for k in ('klv', 'kla', 'cev', 'cea', 'cons') if w.get(k))

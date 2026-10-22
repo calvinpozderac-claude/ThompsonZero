@@ -416,7 +416,8 @@ impl PyAzEngine {
         c_puct=1.5, fpu_reduction=0.2, virtual_loss=1.0, noise_alpha=10.0, noise_frac=0.25,
         temp_threshold=20, max_plies=None, reuse_tree=true, double_aux=1, double_min_visits=8,
         arena_games=None, external=false, openings=None, opening_plies=2, service=false,
-        select="puct", ts_c=None, ts_from=0.0, mixmax=0.0, pick_frac=0.0))]
+        select="puct", ts_c=None, ts_from=0.0, mixmax=0.0, pick_frac=0.0, aux_depth=1, aux_pow=0.0,
+        q_lambda=0.0, q_min_visits=1, stv_lambda=0.8))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         game: &str,
@@ -445,6 +446,11 @@ impl PyAzEngine {
         ts_from: f32,
         mixmax: f32,
         pick_frac: f32,
+        aux_depth: usize,
+        aux_pow: f32,
+        q_lambda: f32,
+        q_min_visits: u32,
+        stv_lambda: f32,
     ) -> PyResult<Self> {
         if groups == 0 || num_games < groups {
             return Err(PyValueError::new_err("need num_games >= groups >= 1"));
@@ -487,6 +493,11 @@ impl PyAzEngine {
             reuse_tree,
             double_aux,
             double_min_visits,
+            aux_depth,
+            aux_pow,
+            q_lambda,
+            q_min_visits,
+            stv_lambda,
             arena_games,
             external,
             openings: openings.unwrap_or_default(),
@@ -572,7 +583,9 @@ impl PyAzEngine {
     }
 
     /// Every sample from games finished since the last call, as a dict of
-    /// dense numpy arrays: obs (n, C, H, W), pi (n, A), z (n,), z_w (n,).
+    /// dense numpy arrays: obs (n, C, H, W), pi (n, A), z (n,), z_w (n,),
+    /// pi_w, q, main, stv, stv_w (n,), reply (n, A), reply_w (n,), own (n,
+    /// H * W), own_w (n,) -- see `AzSample`.
     fn drain<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let samples = each_az!(&mut self.inner, e => e.drain());
         az_samples_to_dict(py, &samples, self.obs_shape, self.num_actions)
@@ -652,21 +665,34 @@ fn az_samples_to_dict<'py>(
     let (c, h, w) = shape;
     let mut obs = Array2::<f32>::zeros((n, c * h * w));
     let mut pi = Array2::<f32>::zeros((n, na));
-    let mut z = Array1::<f32>::zeros(n);
-    let mut z_w = Array1::<f32>::zeros(n);
+    let mut reply = Array2::<f32>::zeros((n, na));
+    let mut own = Array2::<f32>::zeros((n, h * w));
+    let mut cols: [Array1<f32>; 9] = std::array::from_fn(|_| Array1::<f32>::zeros(n));
     for (i, x) in s.iter().enumerate() {
         obs.row_mut(i).as_slice_mut().unwrap().copy_from_slice(&x.obs);
         for &(a, p) in &x.pi {
             pi[[i, a as usize]] = p;
         }
-        z[i] = x.z;
-        z_w[i] = x.z_w;
+        for &(a, p) in &x.reply {
+            reply[[i, a as usize]] = p;
+        }
+        if !x.own.is_empty() {
+            own.row_mut(i).as_slice_mut().unwrap().copy_from_slice(&x.own);
+        }
+        let row = [x.z, x.z_w, x.pi_w, x.q, x.main as u8 as f32, x.stv, x.stv_w, x.reply_w, x.own_w];
+        for (col, v) in cols.iter_mut().zip(row) {
+            col[i] = v;
+        }
     }
     let out = PyDict::new(py);
     out.set_item("obs", obs.into_shape_with_order((n, c, h, w)).unwrap().into_pyarray(py))?;
     out.set_item("pi", pi.into_pyarray(py))?;
-    out.set_item("z", z.into_pyarray(py))?;
-    out.set_item("z_w", z_w.into_pyarray(py))?;
+    out.set_item("reply", reply.into_pyarray(py))?;
+    out.set_item("own", own.into_pyarray(py))?;
+    let names = ["z", "z_w", "pi_w", "q", "main", "stv", "stv_w", "reply_w", "own_w"];
+    for (name, col) in names.into_iter().zip(cols) {
+        out.set_item(name, col.into_pyarray(py))?;
+    }
     Ok(out)
 }
 

@@ -13,7 +13,7 @@ import torch
 
 _SQUARES = {'othello': 8}
 _SPATIAL = ('obs', 'next_obs')                 # (n, C, s, s)
-_PER_ACTION = ('pi', 'legal', 'ev', 'ev_mask')  # (n, A, ...)
+_PER_ACTION = ('pi', 'reply', 'own', 'legal', 'ev', 'ev_mask')  # (n, A or s*s, ...)
 
 
 def _d4(x, k):

@@ -21,6 +21,16 @@
 //! visit distribution and their search value q as the value target.  Forced
 //! moves (a single legal action) are played without search and emit nothing.
 //!
+//! Generalised targets (all inert at their defaults): the off-path samples
+//! may come from any depth up to `aux_depth` below the root (the played
+//! child's subtree excluded), ranked by visits and weighted
+//! (n / N_root)^`aux_pow`; search values may be max-weighted (`q_lambda`,
+//! see `Tree::mix_values`).  Every sample also carries its search value q,
+//! and played positions carry a short-term value (an exponentially weighted
+//! average, factor `stv_lambda`, of the later root values ending in the
+//! result), the next move's visit distribution (the opponent's reply) and
+//! the final board's ownership, for auxiliary losses.
+//!
 //! ARENA mode plays `arena_games` games: game k starts from opening
 //! `openings[(k / 2) % len]` (or `opening_plies` random plies if there are
 //! none) and net 0 plays black in even games, white in odd ones, so every
@@ -68,6 +78,16 @@ pub struct AzConfig {
     /// per move, if visited at least `double_min_visits` times.
     pub double_aux: usize,
     pub double_min_visits: u32,
+    /// Off-path samples from at most this depth below the root (1: children).
+    pub aux_depth: usize,
+    /// Off-path sample weight (n / N_root)^aux_pow (0: weight 1).
+    pub aux_pow: f32,
+    /// Search values: `Tree::mix_values` with this weight on the best child
+    /// (0: the mean) over children with at least `q_min_visits` visits.
+    pub q_lambda: f32,
+    pub q_min_visits: u32,
+    /// Short-term value: stv_t = (1 - l) q_t + l stv_(t+1), ending in z.
+    pub stv_lambda: f32,
     /// `Some(n)`: arena mode, play `n` games then stop.
     pub arena_games: Option<usize>,
     /// Arena: net 0's opponent moves come from `play_external`.
@@ -112,6 +132,11 @@ impl Default for AzConfig {
             reuse_tree: true,
             double_aux: 1,
             double_min_visits: 8,
+            aux_depth: 1,
+            aux_pow: 0.0,
+            q_lambda: 0.0,
+            q_min_visits: 1,
+            stv_lambda: 0.8,
             arena_games: None,
             external: false,
             openings: Vec::new(),
@@ -129,9 +154,27 @@ pub struct AzSample {
     pub pi: Vec<(u16, f32)>,
     /// Value target for the mover: the game result, or q for doubles.
     pub z: f32,
-    /// 0 when the game was cut off before its outcome was observed.
+    /// 0 when the game was cut off before its outcome was observed; an
+    /// off-path sample's weight.
     pub z_w: f32,
+    /// Weight of the policy target.
+    pub pi_w: f32,
+    /// Search value of the position for the mover.
+    pub q: f32,
+    /// A position played in the game (not an off-path sample).
+    pub main: bool,
+    /// Played positions: short-term value target and its weight.
+    pub stv: f32,
+    pub stv_w: f32,
+    /// Played positions: the next move's visit distribution (from the
+    /// opponent's point of view), weight 0 if the next move was not searched.
+    pub reply: Vec<(u16, f32)>,
+    pub reply_w: f32,
+    /// Played positions: final ownership for the mover, weight 0 if unknown.
+    pub own: Vec<f32>,
+    pub own_w: f32,
     player: u8,
+    ply: usize,
 }
 
 /// An arena game's result for net 0 (+1 / 0 / -1); `seat0` is net 0's player.
@@ -560,14 +603,29 @@ impl<G: Game> Slot<G> {
             if pi.is_empty() {
                 pi.push((action, 1.0)); // sims = 0: the move played
             }
+            let mix = (cfg.q_lambda > 0.0).then(|| self.tree.mix_values(cfg.q_lambda, cfg.q_min_visits));
+            let q = match &mix {
+                Some(m) => m[0],
+                None => self.tree.mean_value(0),
+            };
             self.hist.push(AzSample {
                 obs,
                 pi,
                 z: 0.0,
                 z_w: 1.0,
+                pi_w: 1.0,
+                q,
+                main: true,
+                stv: 0.0,
+                stv_w: 0.0,
+                reply: Vec::new(),
+                reply_w: 0.0,
+                own: Vec::new(),
+                own_w: 0.0,
                 player: self.state.current_player() as u8,
+                ply: self.ply,
             });
-            self.emit_doubles(idx, cfg);
+            self.emit_doubles(idx, cfg, mix.as_deref());
         }
         self.state.apply(action);
         if selfplay && cfg.reuse_tree {
@@ -581,22 +639,36 @@ impl<G: Game> Slot<G> {
     }
 
     /// OLIVAW's doubling: the most visited unplayed children are free,
-    /// well-resolved targets, with their search value q in place of z.
-    fn emit_doubles(&mut self, played: usize, cfg: &AzConfig) {
+    /// well-resolved targets, with their search value q in place of z --
+    /// generalised to nodes down to `aux_depth`, weighted by visits.
+    fn emit_doubles(&mut self, played: usize, cfg: &AzConfig, mix: Option<&[f32]>) {
         if cfg.double_aux == 0 {
             return;
         }
-        let edges = self.tree.edges_of(0);
-        let mut order: Vec<(u32, usize)> = edges.iter().enumerate().map(|(i, e)| (e.n, i)).collect();
-        order.sort_by_key(|x| std::cmp::Reverse(x.0));
-        let mut got = 0;
-        for (n, i) in order {
-            if n < cfg.double_min_visits || got == cfg.double_aux {
-                break;
+        let root_n = self.tree.visits(0).max(1) as f32;
+        // (visits into the node, node), breadth-first below the root
+        let mut cands: Vec<(u32, u32)> = Vec::new();
+        let mut frontier: Vec<u32> = vec![0];
+        for depth in 1..=cfg.aux_depth.max(1) {
+            let mut next = Vec::new();
+            for &n in &frontier {
+                for (i, e) in self.tree.edges_of(n).iter().enumerate() {
+                    if (n == 0 && i == played) || e.child == NONE || e.n < cfg.double_min_visits {
+                        continue;
+                    }
+                    cands.push((e.n, e.child));
+                    if depth < cfg.aux_depth {
+                        next.push(e.child);
+                    }
+                }
             }
-            let child = self.tree.edges_of(0)[i].child;
-            if i == played || child == NONE {
-                continue;
+            frontier = next;
+        }
+        cands.sort_by_key(|x| std::cmp::Reverse(x.0));
+        let mut got = 0;
+        for (n, child) in cands {
+            if got == cfg.double_aux {
+                break;
             }
             let pi = self.tree.policy(child);
             if pi.is_empty() {
@@ -605,12 +677,27 @@ impl<G: Game> Slot<G> {
             let node = &self.tree.nodes[child as usize];
             let mut obs = vec![0f32; G::OBS_SIZE];
             node.state.encode(&mut obs);
+            let q = match mix {
+                Some(m) => m[child as usize],
+                None => self.tree.mean_value(child),
+            };
+            let w = if cfg.aux_pow > 0.0 { (n as f32 / root_n).powf(cfg.aux_pow) } else { 1.0 };
             self.aux.push(AzSample {
                 obs,
                 pi,
-                z: self.tree.mean_value(child),
-                z_w: 1.0,
+                z: q,
+                z_w: w,
+                pi_w: w,
+                q,
+                main: false,
+                stv: q,
+                stv_w: 0.0,
+                reply: Vec::new(),
+                reply_w: 0.0,
+                own: Vec::new(),
+                own_w: 0.0,
                 player: node.player,
+                ply: 0,
             });
             self.stats.double_aux += 1;
             got += 1;
@@ -639,10 +726,34 @@ impl<G: Game> Slot<G> {
             });
             return;
         }
+        let squares = G::OBS_SHAPE[1] * G::OBS_SHAPE[2];
+        let mut own = vec![0f32; squares];
         for t in &mut self.hist {
             match self.state.result_for(t.player as usize) {
                 Some(r) => t.z = r as f32,
                 None => t.z_w = 0.0,
+            }
+            if outcome.is_some() && self.state.ownership(t.player as usize, &mut own) {
+                t.own = own.clone();
+                t.own_w = 1.0;
+            }
+        }
+        // short-term values (backwards from z, or the last q if cut off)
+        // and the opponent's reply policy
+        let l = cfg.stv_lambda;
+        for i in (0..self.hist.len()).rev() {
+            let (next, persp_same) = match self.hist.get(i + 1) {
+                Some(nx) => (nx.stv, nx.player == self.hist[i].player),
+                None => (if outcome.is_some() { self.hist[i].z } else { self.hist[i].q }, true),
+            };
+            let next = if persp_same { next } else { -next };
+            let t = &mut self.hist[i];
+            t.stv = (1.0 - l) * t.q + l * next;
+            t.stv_w = 1.0;
+            if let Some(nx) = self.hist.get(i + 1).filter(|nx| nx.ply == self.hist[i].ply + 1) {
+                let reply = nx.pi.clone();
+                self.hist[i].reply = reply;
+                self.hist[i].reply_w = 1.0;
             }
         }
         self.stats.samples += (self.hist.len() + self.aux.len()) as u64;
@@ -692,6 +803,49 @@ mod tests {
             assert!((p - 1.0).abs() < 1e-4);
             assert!((-1.0..=1.0).contains(&s.z));
         }
+    }
+
+    #[test]
+    fn auxiliary_targets_are_consistent() {
+        let mut e = AzEngine::<Othello>::new(AzConfig {
+            sims: 64,
+            double_aux: 8,
+            double_min_visits: 2,
+            aux_depth: 3,
+            aux_pow: 1.0,
+            q_lambda: 1.0,
+            ..cfg()
+        });
+        let mut guard = 0;
+        while e.stats().games < 4 {
+            for g in 0..e.cfg.groups {
+                let (_, nets) = e.collect(g);
+                let (v, l) = uniform::<Othello>(nets.len());
+                e.apply(g, &v, None, &l);
+            }
+            guard += 1;
+            assert!(guard < 100_000);
+        }
+        let samples = e.drain();
+        let (main, aux): (Vec<_>, Vec<_>) = samples.iter().partition(|s| s.main);
+        assert!(aux.len() > main.len(), "deeper doubling should add more than one per move");
+        for s in &aux {
+            assert!(s.z_w > 0.0 && s.z_w <= 1.0 && s.pi_w == s.z_w && s.z == s.q);
+            assert!(s.own_w == 0.0 && s.reply_w == 0.0 && s.stv_w == 0.0);
+        }
+        let mut replies = 0;
+        for s in &main {
+            assert!((-1.0..=1.0).contains(&s.stv) && (-1.0..=1.0).contains(&s.q));
+            assert_eq!(s.own_w, 1.0); // no cutoffs in Othello
+            let disc_diff: f32 = s.own.iter().sum();
+            assert_eq!(disc_diff.signum() == s.z.signum() || s.z == 0.0, true);
+            if s.reply_w > 0.0 {
+                replies += 1;
+                let p: f32 = s.reply.iter().map(|x| x.1).sum();
+                assert!((p - 1.0).abs() < 1e-4);
+            }
+        }
+        assert!(replies > main.len() / 2);
     }
 
     #[test]

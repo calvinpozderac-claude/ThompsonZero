@@ -24,7 +24,8 @@ baseline in its heads only.
 AlphaZero (`AZNet`): the AlphaGo Zero network, as OLIVAW uses it -- a
 convolutional block, a tower of plain residual blocks (BatchNorm, no
 squeeze-excitation), a policy head (logits over every action id) and a tanh
-value head.
+value head.  Auxiliary heads (`aux`: q, stv, own, reply, var) only shape
+the trunk in training (`forward(x, aux=True)`); search never reads them.
 
 `postprocess` turns a forward pass into the arrays the matching Rust engine
 consumes, and `empty_outputs` is the same for a batch of zero rows.
@@ -175,13 +176,22 @@ class AZResBlock(nn.Module):
         return F.relu(self.body(x) + x)
 
 
+def _value_like(channels, hw, hidden, out):
+    """AlphaGo Zero's value head shape, without the final activation."""
+    return nn.Sequential(
+        nn.Conv2d(channels, 1, 1, bias=False), nn.BatchNorm2d(1), nn.ReLU(inplace=True),
+        nn.Flatten(), nn.Linear(hw, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, out))
+
+
 class AZNet(nn.Module):
     """forward(x) -> (v, logits (B, A)) for the mover: v (B,) in [-1, 1],
     or with `wdl` (B, 3) win/draw/loss logits, read by the search as
-    p_win - p_loss (`postprocess`)."""
+    p_win - p_loss (`postprocess`).  forward(x, aux=True) also returns a dict
+    of the auxiliary heads' outputs: q, stv (tanh), var (softplus), own
+    (tanh, per square), score (tanh) and reply (logits)."""
 
     def __init__(self, obs_shape, num_actions, channels=128, blocks=10, value_hidden=256,
-                 wdl=False):
+                 wdl=False, aux=()):
         super().__init__()
         c, h, w = obs_shape
         self.obs_shape, self.num_actions = tuple(obs_shape), num_actions
@@ -196,11 +206,36 @@ class AZNet(nn.Module):
             nn.Conv2d(channels, 1, 1, bias=False), nn.BatchNorm2d(1), nn.ReLU(inplace=True),
             nn.Flatten(), nn.Linear(h * w, value_hidden), nn.ReLU(inplace=True),
             *((nn.Linear(value_hidden, 3),) if wdl else (nn.Linear(value_hidden, 1), nn.Tanh())))
+        hw = h * w
+        self.aux = nn.ModuleDict()
+        for name in ('q', 'stv', 'var'):
+            if name in aux:
+                self.aux[name] = _value_like(channels, hw, value_hidden, 1)
+        if 'own' in aux:
+            self.aux['own'] = nn.Conv2d(channels, 1, 1)
+            self.aux['score'] = _value_like(channels, hw, value_hidden, 1)
+        if 'reply' in aux:
+            self.aux['reply'] = nn.Sequential(
+                nn.Conv2d(channels, 2, 1, bias=False), nn.BatchNorm2d(2), nn.ReLU(inplace=True),
+                nn.Flatten(), nn.Linear(2 * hw, num_actions))
 
-    def forward(self, x):
+    def forward(self, x, aux=False):
         t = self.trunk(self.stem(x))
         v = self.value(t)
-        return (v if self.wdl else v.squeeze(1)), self.policy(t)
+        v = v if self.wdl else v.squeeze(1)
+        if not aux:
+            return v, self.policy(t)
+        out = {}
+        for name, head in self.aux.items():
+            y = head(t).flatten(1)
+            if name in ('q', 'stv', 'score'):
+                y = torch.tanh(y.squeeze(1))
+            elif name == 'var':
+                y = F.softplus(y.squeeze(1))
+            elif name == 'own':
+                y = torch.tanh(y)
+            out[name] = y
+        return v, self.policy(t), out
 
     def postprocess(self, v, logits):
         """-> (v (B,), logits (B, A)) as fp32 for `AzEngine.apply`, plus the
@@ -219,8 +254,9 @@ def build(cfg, obs_shape, num_actions):
     if cfg.algo == 'az':
         if cfg.value_head not in ('scalar', 'wdl'):
             raise ValueError(f'unknown value_head {cfg.value_head!r}')
+        aux = [k for k in ('q', 'stv', 'own', 'reply', 'var') if getattr(cfg, f'{k}_head', 0) > 0]
         return AZNet(obs_shape, num_actions, cfg.channels, cfg.blocks,
-                     wdl=cfg.value_head == 'wdl')
+                     wdl=cfg.value_head == 'wdl', aux=aux)
     net = DirichletNet(obs_shape, num_actions, cfg.channels, cfg.blocks, cfg.head_channels,
                        cfg.trunk, cal=cfg.cal_conc > 0)
     net.use_cal = cfg.cal_search

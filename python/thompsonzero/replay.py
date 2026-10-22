@@ -21,6 +21,11 @@ AlphaZero row layout (`AZ_SCHEMA`):
     pi             (A,)      search visit distribution (all zero: no target)
     z, z_w         float     value target (game result, or q for doubles)
                              and its weight
+    pi_w, q, main  float     policy weight, search value, 1 for played positions
+    stv, stv_w     float     short-term value target and weight
+    reply_w, own_w float     weights of the optional rows below
+    reply          (A,)      the opponent's next search policy   (`az_schema(reply=True)`)
+    own            (H*W,)    final ownership for the mover       (`az_schema(own=True)`)
 """
 import numpy as np
 import torch
@@ -38,7 +43,20 @@ TZ_SCHEMA = {
 AZ_SCHEMA = {
     'obs': ('obs', torch.float16, False), 'pi': (('A',), torch.float16, False),
     'z': ((), torch.float16, False), 'z_w': ((), torch.float16, False),
+    'pi_w': ((), torch.float16, False), 'q': ((), torch.float16, False),
+    'main': ((), torch.float16, False), 'stv': ((), torch.float16, False),
+    'stv_w': ((), torch.float16, False), 'reply_w': ((), torch.float16, False),
+    'own_w': ((), torch.float16, False),
 }
+
+
+def az_schema(reply=False, own=False, squares=64):
+    s = dict(AZ_SCHEMA)
+    if reply:
+        s['reply'] = (('A',), torch.float16, False)
+    if own:
+        s['own'] = ((squares,), torch.float16, False)
+    return s
 
 
 class ReplayBuffer:
@@ -95,11 +113,13 @@ class ReplayBuffer:
         """A well-formed batch of the right shapes and dtypes (finite
         targets, no successors), for compiling the training step."""
         b = {k: v[:1].expand(batch_size, *v.shape[1:]).clone() for k, v in self.data.items()}
-        for k, fill in (('v', 1.0), ('ev', 1.0), ('played', -1), ('next_term', -1), ('z_w', 1.0)):
+        for k, fill in (('v', 1.0), ('ev', 1.0), ('played', -1), ('next_term', -1), ('z_w', 1.0),
+                        ('pi_w', 1.0), ('main', 1.0), ('stv_w', 1.0), ('reply_w', 1.0), ('own_w', 1.0)):
             if k in b:
                 b[k].fill_(fill)
-        if 'pi' in b:
-            b['pi'].fill_(1.0 / b['pi'].shape[1])
+        for k in ('pi', 'reply'):
+            if k in b:
+                b[k].fill_(1.0 / b[k].shape[1])
         return {k: (v.long() if k in self.long else v.float() if v.is_floating_point() else v)
                 for k, v in b.items()}
 

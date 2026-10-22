@@ -47,4 +47,11 @@ pub trait Game: Clone + Send + Sync + 'static {
     fn result_for(&self, player: usize) -> Option<i8> {
         self.outcome().map(|r| if player == 0 { r } else { -r })
     }
+
+    /// Per-square ownership for `player` (+1 theirs, -1 the opponent's, 0
+    /// empty) into `out` (OBS_SHAPE[1] * OBS_SHAPE[2] floats); false if the
+    /// game has no such notion.
+    fn ownership(&self, _player: usize, _out: &mut [f32]) -> bool {
+        false
+    }
 }

@@ -294,7 +294,8 @@ def test_edax_match_any_algorithm(rule):
 
 def test_replay_window_samples_only_the_newest_rows():
     from thompsonzero.replay import AZ_SCHEMA, ReplayBuffer
-    buf = ReplayBuffer(10, (3, 8, 8), 65, 'cpu', AZ_SCHEMA)
+    schema = {k: AZ_SCHEMA[k] for k in ('obs', 'pi', 'z', 'z_w')}
+    buf = ReplayBuffer(10, (3, 8, 8), 65, 'cpu', schema)
     for start in (0, 6, 12):   # 18 rows through a 10-row ring
         n = 6
         buf.add({'obs': np.zeros((n, 3, 8, 8), np.float32), 'pi': np.zeros((n, 65), np.float32),
@@ -444,3 +445,38 @@ def test_az_mixmax_and_q_pick():
             obs, _ = eng.collect(k)
             eng.apply(k, *evs[0].evaluate(obs))
     assert eng.stats()['sims'] > 0
+
+
+def test_az_auxiliary_targets():
+    """Generalised doubling, z/q blending and every auxiliary head: samples
+    carry the targets, the buffer and augmentation keep them, the loss is
+    finite and trains, and inference still sees (v, logits)."""
+    from thompsonzero import az, symmetry
+    from thompsonzero.train import make_buffer
+    cfg = preset('othello', 'az', channels=8, blocks=1, num_games=8, groups=2,
+                 double_aux=4, double_min_visits=2, aux_depth=2, aux_pow=1.0, q_lambda=0.5,
+                 q_blend=0.5, aux_to_main=False, q_head=1.0, stv_head=1.0, own_head=1.0,
+                 reply_head=0.15, var_head=1.0, buffer_size=4096)
+    g = GameState('othello')
+    net = build(cfg, g.obs_shape, g.num_actions)
+    evs = [Evaluator(net.eval(), 'cpu', amp=False)] * 2
+    eng = az.make_engine(cfg, 0, 16)
+    while eng.stats()['games'] < 2:
+        for k in range(eng.groups):
+            obs, _ = eng.collect(k)
+            eng.apply(k, *evs[0].evaluate(obs))
+    s = eng.drain()
+    main = s['main'] > 0
+    assert main.any() and (~main).any()
+    assert (s['own_w'][main] == 1).all() and (s['reply_w'][~main] == 0).all()
+    assert np.allclose(s['reply'][s['reply_w'] > 0].sum(-1), 1, atol=1e-3)
+    buf = make_buffer(cfg, g.obs_shape, g.num_actions, 'cpu')
+    buf.add(s)
+    b = symmetry.augment(buf.sample(64), 'othello')
+    net.train()
+    v, logits, extra = net(b['obs'], aux=True)
+    assert set(extra) == {'q', 'stv', 'own', 'score', 'reply', 'var'}
+    total, parts = az.compute(v, logits, b, 1.0, extra, cfg)
+    total.backward()
+    assert torch.isfinite(total) and all(torch.isfinite(x) for x in parts.values())
+    assert len(net.eval()(b['obs'])) == 2

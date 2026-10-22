@@ -101,9 +101,22 @@ class Config:
     az_select: str = 'puct'               # puct | thompson (win/draw/loss Dirichlet draws) | gaussian
     ts_c: float = 0.0                     # Thompson draws' scale in place of c_puct (0: c_puct)
     ts_from: float = 0.0                  # PUCT for this fraction of each search's sims, then Thompson
+                                          # with sd = PUCT's U (src/puct.rs)
     mixmax: float = 0.0                   # node value = (1 - l) mean + l best child (0: AlphaZero's mean)
     pick_frac: float = 0.0                # play the best-Q move with >= this fraction of top visits (0: most visited)
-                                          # with sd = PUCT's U (src/puct.rs)
+    # az training targets (src/az.rs, az.compute); every default is the plain baseline
+    aux_depth: int = 1                    # doubling: off-path nodes down to this depth (1: root children)
+    aux_pow: float = 0.0                  # ...weighted (visits / root visits)^aux_pow (0: weight 1)
+    q_lambda: float = 0.0                 # search values q = (1 - l) mean + l best child, recursively
+    q_min_visits: int = 1                 # ...over children with at least this many visits
+    stv_lambda: float = 0.8               # short-term value: stv_t = (1 - l) q_t + l stv_t+1, ending in z
+    q_blend: float = 0.0                  # value target of played positions: (1 - a) z + a q
+    aux_to_main: bool = True              # doubled samples train the value head (False: only a q head)
+    q_head: float = 0.0                   # weights of auxiliary heads (0: no head): search value q,
+    stv_head: float = 0.0                 #   short-term value,
+    own_head: float = 0.0                 #   final ownership per square + disc difference,
+    reply_head: float = 0.0               #   the opponent's next search policy,
+    var_head: float = 0.0                 #   squared value error (z - v)^2
 
     # ── self-play engine ────────────────────────────────────────────────────
     num_games: int = 1024                 # concurrent games (all CPU cores share them)
@@ -112,11 +125,14 @@ class Config:
 
     # ── training ────────────────────────────────────────────────────────────
     episodes: int = 50_000
+    stop_at: int = 0                      # end the run here (0: at `episodes`); schedules keep `episodes`
     batch_size: int = 1024
     train_steps_per_episode: float = 6.0
     buffer_size: int = 600_000
     # ((fraction of run, newest samples drawn from), ...); () = whole buffer
     window_ramp: tuple = ()
+    window_main: bool = False             # az: window_ramp counts played positions (rows scaled by
+                                          # all rows / played rows, so doubling does not shrink it)
     lr_warmup_episodes: int = 100
     # ((fraction of run, lr), ...): 3e-3, 1e-3 from 20%, 1e-4 from 55%
     lr_steps: tuple = ((0.0, 3e-3), (0.20, 1e-3), (0.55, 1e-4))

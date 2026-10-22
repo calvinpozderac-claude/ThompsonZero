@@ -155,6 +155,15 @@ impl Game for Othello {
         }
     }
 
+    fn ownership(&self, player: usize, out: &mut [f32]) -> bool {
+        let (me, opp) = (self.discs[player], self.discs[1 - player]);
+        for (i, x) in out[..64].iter_mut().enumerate() {
+            let bit = 1u64 << i;
+            *x = (me & bit != 0) as u8 as f32 - (opp & bit != 0) as u8 as f32;
+        }
+        true
+    }
+
     fn render(&self) -> String {
         let mut s = String::from("  a b c d e f g h\n");
         for r in 0..8 {
