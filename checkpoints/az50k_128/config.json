@@ -1,0 +1,107 @@
+{
+  "game": "othello",
+  "run_dir": "runs/az50k_128",
+  "seed": 0,
+  "algo": "az",
+  "channels": 128,
+  "blocks": 10,
+  "head_channels": 8,
+  "search_rule": "additive_mle",
+  "target_rule": "avgconc",
+  "rho_search": 0.8,
+  "rho_target": 0.999,
+  "sample_leaf": false,
+  "virtual_loss": 1.0,
+  "descent_temp": 1.0,
+  "sims_ramp": [
+    [
+      0.0,
+      100
+    ],
+    [
+      0.2,
+      200
+    ],
+    [
+      0.55,
+      400
+    ]
+  ],
+  "temp_threshold": 20,
+  "double_aux": 1,
+  "double_min_visits": 8,
+  "solved_aux": true,
+  "max_plies": 0,
+  "c_puct": 1.5,
+  "fpu_reduction": 0.2,
+  "noise_alpha": 10.0,
+  "noise_frac": 0.25,
+  "reuse_tree": true,
+  "num_games": 1024,
+  "groups": 2,
+  "wave": 4,
+  "episodes": 50000,
+  "batch_size": 1024,
+  "train_steps_per_episode": 2.0,
+  "buffer_size": 1450000,
+  "window_ramp": [
+    [
+      0.0,
+      575000
+    ],
+    [
+      0.2,
+      860000
+    ],
+    [
+      0.4,
+      1150000
+    ],
+    [
+      0.6,
+      1440000
+    ]
+  ],
+  "lr_warmup_episodes": 100,
+  "lr_steps": [
+    [
+      0.0,
+      0.1
+    ],
+    [
+      0.2,
+      0.03
+    ],
+    [
+      0.55,
+      0.003
+    ]
+  ],
+  "weight_decay": 0.0002,
+  "optimizer": "sgd",
+  "momentum": 0.9,
+  "augment": true,
+  "value_weight": 1.0,
+  "grad_clip": 1.0,
+  "loss_weights": {
+    "klv": 1.0,
+    "kla": 2.0,
+    "cev": 1.0,
+    "cea": 1.0,
+    "cons": 0.5
+  },
+  "sync_every_steps": 6,
+  "max_pending": 4,
+  "device": "auto",
+  "amp": true,
+  "compile": true,
+  "log_every": 500,
+  "checkpoint_every": 1000,
+  "benchmark_every": 2500,
+  "save_buffer": true,
+  "quick_eval_games": 64,
+  "fresh_eval_every": 50,
+  "eval_sims": 400,
+  "eval_games": 24,
+  "eval_opponents": 4
+}
